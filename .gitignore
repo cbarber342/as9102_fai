@@ -1,0 +1,61 @@
+# Data artifacts (do not commit)
+/data/
+**/*.parquet
+**/*.feather
+**/*.csv
+**/*.csv.gz
+**/*.db
+**/*.sqlite
+**/*.jsonl
+**/*.arrow
+
+# Python venvs
+.venv/
+venv/
+
+# PyInstaller / build outputs
+build/
+ArbScanner.spec
+
+# Bytecode and caches
+__pycache__/
+*.pyc
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+env/
+venv/
+.venv/
+
+# Logs
+logs/
+*.log
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# VS Code
+.vscode/
+.vs/
+
+# Nested repo in this workspace (avoid embedded git repo warning)
+external_as9102_fai/
+
+# Local settings
+config_local.py
+
+# Archives
+*.zip
+
+# Editor/backup files
+*.bak
+
+# Local sample artifacts
+test_input.pdf
+test_output.pdf
+*.as9102_bubbles.json
