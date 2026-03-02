@@ -14,6 +14,14 @@ From the workspace root:
 python -m as9102_fai
 ```
 
+### Windows quick start
+
+```powershell
+./scripts/run_as9102_fai.cmd
+```
+
+If you copied this workspace from another computer and it already has a `.venv/`, delete `.venv/` and re-run the script. Venvs contain absolute paths to the original machine’s Python installation.
+
 ## Python versions
 
 This app supports Python 3.8+ (tested with 3.8–3.12). Dependencies are pinned with
