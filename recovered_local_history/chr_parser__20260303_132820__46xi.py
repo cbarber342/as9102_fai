@@ -219,76 +219,73 @@ class ChrParser:
         return strip_leading_zero(nom_val)
 
     def _expand_threads(self, chars: List[FaiCharacteristic]) -> List[FaiCharacteristic]:
-        expanded = []
-        
+        expanded: List[FaiCharacteristic] = []
+
         for char in chars:
             expanded.append(char)
-            
-            if char.is_thread and not char.is_attribute:
-                # 1. Add Go/No Go Check
-                base_id = str(getattr(char, "id", "") or "").strip()
-                base_feat = str(getattr(char, "feature_name", "") or "").strip()
-                # Form 3 uses `id` as the Description/Note text; keep this human-readable.
-                gng_label = (base_id + " Go/No Go").strip() if base_id else "Go/No Go"
-                go_no_go = FaiCharacteristic(
-                    id=gng_label,
-                    feature_name=(base_feat + " Go/No Go").strip() if base_feat else "Go/No Go",
-                    # Leave specification blank; this is an attribute check row.
-                    description="",
-                    actual="", # User to fill or default to Pass
-                    nominal="Pass",
-                    upper_tol="",
-                    lower_tol="",
-                    type="Attribute",
-                    unit=char.unit,
-                    group1=char.group1,
-                    source="derived",
-                    is_attribute=True,
-                    is_thread=True
-                )
-                expanded.append(go_no_go)
-                
-                # 2. Add Minor Diameter Check
-                # Check if a "Minor" feature already exists for this thread.
-                found_minor = False
-                
-                # If the current char description says "Minor", don't add another.
-                if "minor" in char.feature_name.lower() or "minor" in char.id.lower():
-                    found_minor = True
 
-                if not found_minor:
-                    # Scan other chars to see if they are the minor dia for this thread
-                    for existing in chars:
-                        if existing == char: continue
-                        
-                        is_minor = "minor" in existing.feature_name.lower() or "minor" in existing.id.lower()
-                        if is_minor:
-                            # Check if it relates to this thread
-                            # e.g. if char.id is "Thread1", does existing.id contain "Thread1"?
-                            # Or if feature_name matches
-                            if (char.id and char.id.lower() in existing.id.lower()) or \
-                               (char.feature_name and char.feature_name.lower() in existing.feature_name.lower()):
-                                 found_minor = True
-                                 break
+            # Only expand Calypso-imported thread rows; derived rows should not recurse.
+            try:
+                is_calypso = str(getattr(char, "source", "calypso") or "calypso").strip().lower() == "calypso"
+            except Exception:
+                is_calypso = True
 
-                if not found_minor:
-                    minor_label = (base_id + " Minor Diameter").strip() if base_id else "Minor Diameter"
-                    minor_dia = FaiCharacteristic(
-                        id=minor_label,
-                        feature_name=(base_feat + " Minor Diameter").strip() if base_feat else "Minor Diameter",
-                        # Leave specification blank; this is an attribute check row.
-                        description="",
-                        actual="", 
-                        nominal="",
-                        upper_tol="",
-                        lower_tol="",
-                        type="Attribute", 
-                        unit=char.unit,
-                        group1=char.group1,
-                        source="derived",
-                        is_attribute=True,
-                        is_thread=True
-                    )
-                    expanded.append(minor_dia)
-                
+            if not (
+                bool(getattr(char, "is_thread", False))
+                and is_calypso
+                and (not bool(getattr(char, "is_attribute", False)))
+            ):
+                continue
+
+            base_name = str(getattr(char, "id", "") or "").strip()
+            go_no_go_name = (base_name + " Go/No Go").strip() if base_name else "Go/No Go"
+            minor_dia_name = (base_name + " Minor Diameter").strip() if base_name else "Minor Diameter"
+
+            # Attribute-style derived checks; keep requirement non-empty so downstream code doesn't drop the row.
+            go_no_go = FaiCharacteristic(
+                id=go_no_go_name,
+                feature_name=str(getattr(char, "feature_name", "") or "").strip(),
+                description="",
+                actual="",
+                nominal="",
+                upper_tol="",
+                lower_tol="",
+                type="Attribute",
+                unit=str(getattr(char, "unit", "") or ""),
+                group1=str(getattr(char, "group1", "") or ""),
+                idsymbol=str(getattr(char, "idsymbol", "") or ""),
+                mmc=str(getattr(char, "mmc", "") or ""),
+                datumaid=str(getattr(char, "datumaid", "") or ""),
+                datumbid=str(getattr(char, "datumbid", "") or ""),
+                datumcid=str(getattr(char, "datumcid", "") or ""),
+                source="derived",
+                is_thread=True,
+                is_attribute=True,
+                comment=str(getattr(char, "comment", "") or ""),
+            )
+            expanded.append(go_no_go)
+
+            minor_dia = FaiCharacteristic(
+                id=minor_dia_name,
+                feature_name=str(getattr(char, "feature_name", "") or "").strip(),
+                description="",
+                actual="",
+                nominal="",
+                upper_tol="",
+                lower_tol="",
+                type="Attribute",
+                unit=str(getattr(char, "unit", "") or ""),
+                group1=str(getattr(char, "group1", "") or ""),
+                idsymbol=str(getattr(char, "idsymbol", "") or ""),
+                mmc=str(getattr(char, "mmc", "") or ""),
+                datumaid=str(getattr(char, "datumaid", "") or ""),
+                datumbid=str(getattr(char, "datumbid", "") or ""),
+                datumcid=str(getattr(char, "datumcid", "") or ""),
+                source="derived",
+                is_thread=True,
+                is_attribute=True,
+                comment=str(getattr(char, "comment", "") or ""),
+            )
+            expanded.append(minor_dia)
+
         return expanded

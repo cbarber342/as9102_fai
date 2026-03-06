@@ -1945,16 +1945,11 @@ class PdfViewer(QWidget):
         # Bubble controls
         self.add_bubble_btn = QPushButton("Add Bubble")
         self.add_bubble_btn.setCheckable(True)
-        self.add_bubble_btn.clicked.connect(self.toggle_placing_mode)
-
-        # Visual: show active state (checked) as light blue.
         try:
-            self.add_bubble_btn.setStyleSheet(
-                "QPushButton:checked { background-color: #ADD8E6; color: #000; }"
-                "QPushButton:pressed { background-color: #ADD8E6; }"
-            )
+            self.add_bubble_btn.setProperty("as9102_mode_button", "true")
         except Exception:
             pass
+        self.add_bubble_btn.clicked.connect(self.toggle_placing_mode)
 
         self.bubble_number_spin = QSpinBox()
         self.bubble_number_spin.setRange(1, 9999)
@@ -1968,16 +1963,11 @@ class PdfViewer(QWidget):
 
         self.add_range_btn = QPushButton("Add Range")
         self.add_range_btn.setCheckable(True)
-        self.add_range_btn.toggled.connect(self.toggle_range_mode)
-
-        # Visual: show active state (checked) as light blue.
         try:
-            self.add_range_btn.setStyleSheet(
-                "QPushButton:checked { background-color: #ADD8E6; color: #000; }"
-                "QPushButton:pressed { background-color: #ADD8E6; }"
-            )
+            self.add_range_btn.setProperty("as9102_mode_button", "true")
         except Exception:
             pass
+        self.add_range_btn.toggled.connect(self.toggle_range_mode)
 
         self.clear_btn = QPushButton("Clear All")
         self.clear_btn.clicked.connect(self.clear_bubbles)
@@ -4510,35 +4500,28 @@ class PdfViewer(QWidget):
                         start, end, x, y, r = spec[:5]
                         bf = spec[5] if len(spec) > 5 else ""
                     except Exception:
-                        # Keep any malformed spec as-is (best effort).
-                        try:
-                            new_specs.append(tuple(spec))
-                        except Exception:
-                            pass
                         continue
 
                     try:
                         s = int(start)
                         e = int(end)
-                        rx = float(x)
-                        ry = float(y)
-                        rr = int(r)
-                        bf2 = str(bf or "")
                     except Exception:
-                        # Keep original if it cannot be normalized.
+                        # Keep unparseable specs unchanged.
                         try:
-                            new_specs.append(tuple(spec))
+                            new_specs.append((start, end, float(x), float(y), int(r), str(bf or "")))
                         except Exception:
                             pass
                         continue
 
-                    s2 = int(norm.get(s, s))
-                    e2 = int(norm.get(e, e))
+                    s2 = int(norm.get(int(s), int(s)))
+                    e2 = int(norm.get(int(e), int(e)))
                     if e2 < s2:
                         e2 = s2
-                    if s2 != s or e2 != e:
+                    if int(s2) != int(s) or int(e2) != int(e):
                         page_changed = True
-                    new_specs.append((int(s2), int(e2), float(rx), float(ry), int(rr), bf2))
+
+                    new_specs.append((int(s2), int(e2), float(x), float(y), int(r), str(bf or "")))
+
                 if page_changed:
                     changed = True
                     new_specs.sort(key=lambda t: (t[0], t[1], t[2], t[3]))

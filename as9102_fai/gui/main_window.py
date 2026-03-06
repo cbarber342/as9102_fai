@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QGroupBox, QFormLayout, QLineEdit, QMessageBox, 
                                QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QTableWidgetSelectionRange,
                                QTabWidget, QGridLayout, QCheckBox, QScrollArea, QSpinBox, QToolBar, QComboBox, QButtonGroup, QColorDialog, QMenu,
-                               QDialog, QProgressBar, QSizePolicy)
+                               QDialog, QProgressBar, QSizePolicy, QInputDialog)
 from PySide6.QtCore import Qt, QTimer, Signal, QRect, QEvent, QObject
 from PySide6.QtCore import QSettings
 from PySide6.QtGui import QColor, QFontDatabase, QPalette, QFontMetrics, QKeySequence, QShortcut
@@ -445,6 +445,13 @@ class MainWindow(QMainWindow):
             type=bool,
         )
 
+        # Per request: always start unchecked, even if it was previously saved.
+        try:
+            self._form3_include_thread_extras = False
+            self._settings.setValue("forms/3/include_thread_extras", False)
+        except Exception:
+            self._form3_include_thread_extras = False
+
         # Form 3 option: GD&T callout rendering mode.
         # Form 3 option: GD&T callout rendering.
         # Per request: always use installed-font mode and default to the "GDT" font.
@@ -514,8 +521,7 @@ class MainWindow(QMainWindow):
 
         if bubbled_numbers is None:
             try:
-                dv = getattr(self, "drawing_viewer_tab", None)
-                pv = getattr(dv, "_pdf_viewer", None) if dv is not None else None
+                pv = self._get_active_drawing_pdf_viewer()
                 if pv is not None and hasattr(pv, "get_bubbled_numbers"):
                     bubbled_numbers = set(pv.get_bubbled_numbers() or set())
             except Exception:
@@ -544,6 +550,38 @@ class MainWindow(QMainWindow):
                     tbl.viewport().update()
         except Exception:
             pass
+
+    def _get_active_drawing_pdf_viewer(self):
+        """Return the PdfViewer instance currently backing the drawing.
+
+        The app can have both an embedded Drawing Viewer tab and a pop-out
+        window; bubbles/reference-location mode should follow whichever viewer
+        is actually in use.
+        """
+        candidates = []
+        for viewer_attr in ("drawing_viewer_tab", "pdf_window"):
+            try:
+                w = getattr(self, viewer_attr, None)
+                pv = getattr(w, "_pdf_viewer", None) if w is not None else None
+                if pv is not None:
+                    candidates.append(pv)
+            except Exception:
+                continue
+
+        # Prefer a viewer that has a loaded doc or bubble state.
+        for pv in candidates:
+            try:
+                if getattr(pv, "doc", None) is not None:
+                    return pv
+            except Exception:
+                return pv
+        for pv in candidates:
+            try:
+                if getattr(pv, "bubble_specs_by_page", None):
+                    return pv
+            except Exception:
+                continue
+        return candidates[0] if candidates else None
 
     def eventFilter(self, obj, event):
         try:
@@ -640,6 +678,148 @@ class MainWindow(QMainWindow):
             viewer3.render()
         except Exception:
             pass
+
+    def _iter_form3_characteristics_for_write(self, *, include_thread_extras: bool) -> list[object]:
+        """Return the ordered list of characteristic objects that Form 3 will write.
+
+        This mirrors the filtering rules in `_write_form3_to_worksheet` so we can
+        build stable bubble-number mappings when derived rows are shown/hidden.
+        """
+        out: list[object] = []
+        for char in (getattr(self, "characteristics", None) or []):
+            if not include_thread_extras:
+                try:
+                    if str(getattr(char, "source", "calypso") or "calypso").strip().lower() != "calypso":
+                        continue
+                except Exception:
+                    pass
+
+            description_text = f"{getattr(char, 'id', '')}".strip()
+            if not description_text:
+                continue
+
+            try:
+                spec_text = str(getattr(char, "description", "") or "").strip()
+            except Exception:
+                spec_text = ""
+            if spec_text and "nan" in spec_text.lower():
+                continue
+
+            try:
+                src = str(getattr(char, "source", "calypso") or "calypso").strip().lower()
+            except Exception:
+                src = "calypso"
+            try:
+                is_attr = bool(getattr(char, "is_attribute", False))
+            except Exception:
+                is_attr = False
+
+            if not spec_text and src == "calypso" and not is_attr:
+                continue
+
+            out.append(char)
+        return out
+
+    def _form3_bubble_number_mapping(self, *, from_include_thread_extras: bool, to_include_thread_extras: bool) -> dict[int, int]:
+        """Compute an old→new bubble-number mapping when toggling derived rows."""
+        old_list = self._iter_form3_characteristics_for_write(include_thread_extras=bool(from_include_thread_extras))
+        new_list = self._iter_form3_characteristics_for_write(include_thread_extras=bool(to_include_thread_extras))
+
+        new_pos_by_obj: dict[int, int] = {}
+        for idx0, ch in enumerate(new_list):
+            new_pos_by_obj[id(ch)] = int(idx0) + 1
+
+        mapping: dict[int, int] = {}
+        for idx0, ch in enumerate(old_list):
+            old_n = int(idx0) + 1
+            new_n = new_pos_by_obj.get(id(ch))
+            if new_n is None:
+                continue
+            if int(new_n) != int(old_n):
+                mapping[int(old_n)] = int(new_n)
+        return mapping
+
+    def _apply_form3_include_thread_extras_toggle(self, enabled: bool) -> None:
+        """Handle user toggling Auto add Go/No Go + Minor Dia.
+
+        When derived rows are inserted/removed, bubble numbers in Form 3 change.
+        Renumber the drawing bubbles to match the new numbering.
+        """
+        enabled = bool(enabled)
+
+        try:
+            old_enabled = bool(getattr(self, "_form3_include_thread_extras", False))
+        except Exception:
+            old_enabled = False
+
+        if enabled != old_enabled:
+            mapping = {}
+            try:
+                mapping = self._form3_bubble_number_mapping(
+                    from_include_thread_extras=old_enabled,
+                    to_include_thread_extras=enabled,
+                )
+            except Exception:
+                mapping = {}
+
+            if mapping:
+                # Apply to both embedded + pop-out viewers (whichever exist).
+                for viewer_attr in ("drawing_viewer_tab", "pdf_window"):
+                    try:
+                        w = getattr(self, viewer_attr, None)
+                        pv = getattr(w, "_pdf_viewer", None) if w is not None else None
+                        if pv is not None and hasattr(pv, "apply_bubble_number_mapping"):
+                            pv.apply_bubble_number_mapping(dict(mapping))
+                    except Exception:
+                        pass
+
+        # Persist the setting and refresh the sheet.
+        try:
+            self._set_form3_include_thread_extras(enabled, persist=True, update_ui=False)
+        except Exception:
+            pass
+
+        try:
+            self._refresh_form3_view()
+        except Exception:
+            pass
+
+        # Refresh bubble fills/reference location after renumber.
+        try:
+            self._sync_bubbles_to_form3()
+        except Exception:
+            pass
+
+    def _set_form3_include_thread_extras(self, enabled: bool, *, persist: bool = True, update_ui: bool = True) -> None:
+        enabled = bool(enabled)
+        try:
+            self._form3_include_thread_extras = enabled
+        except Exception:
+            pass
+
+        if persist:
+            try:
+                self._settings.setValue("forms/3/include_thread_extras", enabled)
+            except Exception:
+                pass
+
+        if not update_ui:
+            return
+
+        for attr in ("_form3_include_thread_cb", "_form3_include_thread_cb_pop"):
+            cb = getattr(self, attr, None)
+            if cb is None:
+                continue
+            try:
+                if bool(cb.isChecked()) == enabled:
+                    continue
+                cb.blockSignals(True)
+                try:
+                    cb.setChecked(enabled)
+                finally:
+                    cb.blockSignals(False)
+            except Exception:
+                pass
 
     def load_defaults(self):
         """Populate the UI with default file paths; auto-load when files exist."""
@@ -2533,6 +2713,10 @@ class MainWindow(QMainWindow):
         if form_key == "3":
             include_thread_cb = QCheckBox("Auto add Go/No Go + Minor Dia")
             include_thread_cb.setChecked(bool(getattr(self, "_form3_include_thread_extras", False)))
+            try:
+                self._form3_include_thread_cb = include_thread_cb
+            except Exception:
+                pass
             header_layout.addWidget(include_thread_cb)
 
             # Fit Rows button is added for all forms above.
@@ -2677,18 +2861,7 @@ class MainWindow(QMainWindow):
 
             # Form 3 checkbox is independent, but it lives next to the paint controls.
             if include_thread_cb is not None:
-                def _persist_and_refresh_form3() -> None:
-                    try:
-                        self._form3_include_thread_extras = include_thread_cb.isChecked()
-                        self._settings.setValue(
-                            "forms/3/include_thread_extras",
-                            self._form3_include_thread_extras,
-                        )
-                    except Exception:
-                        pass
-                    self._refresh_form3_view()
-
-                include_thread_cb.toggled.connect(lambda _checked: _persist_and_refresh_form3())
+                include_thread_cb.toggled.connect(lambda checked: self._apply_form3_include_thread_extras_toggle(bool(checked)))
 
 
         header_layout.addStretch()
@@ -2725,8 +2898,8 @@ class MainWindow(QMainWindow):
             pass
         if form_key == "3":
             viewer.set_hidden_columns([23, 24, 25])
-            # Form 3: auto-fit row heights for wrapped Description/Note text (column G).
-            viewer.set_auto_fit_row_height_columns([7])
+            # Form 3: auto-fit row heights for wrapped text (columns G and M).
+            viewer.set_auto_fit_row_height_columns([7, 13])
             try:
                 viewer.set_custom_undo_handler(self._on_form3_undo_requested)
             except Exception:
@@ -3232,6 +3405,10 @@ class MainWindow(QMainWindow):
         if form_key == "3":
             include_thread_cb = QCheckBox("Auto add Go/No Go + Minor Dia")
             include_thread_cb.setChecked(bool(getattr(self, "_form3_include_thread_extras", False)))
+            try:
+                self._form3_include_thread_cb_pop = include_thread_cb
+            except Exception:
+                pass
             header_layout.addWidget(include_thread_cb)
 
             # Form 3 GD&T controls removed per request (always installed-font mode, font family "GDT").
@@ -3843,6 +4020,57 @@ class MainWindow(QMainWindow):
         self._load_supplier_directory_tab_from_workbook()
         self._load_calibrated_equipment_tab_from_workbook()
 
+        def _apply_default_wrap_columns(ws, cols_1based: list[int], *, max_rows: int) -> None:
+            """Best-effort: set Wrap Text on existing cells in given columns.
+
+            Uses ws._cells to avoid creating new cells (faster on styled templates).
+            """
+            try:
+                from openpyxl.styles import Alignment
+            except Exception:
+                return
+            if ws is None:
+                return
+            try:
+                cols = {int(c) for c in (cols_1based or []) if int(c) > 0}
+            except Exception:
+                cols = set()
+            if not cols:
+                return
+
+            try:
+                limit_r = int(max_rows)
+            except Exception:
+                limit_r = 1000
+            limit_r = max(1, min(int(limit_r), 5000))
+
+            # Only touch existing cells for speed.
+            try:
+                items = list(getattr(ws, "_cells", {}).items())
+            except Exception:
+                items = []
+            for (r, c), cell in items:
+                try:
+                    rr = int(r)
+                    cc = int(c)
+                except Exception:
+                    continue
+                if rr <= 0 or rr > int(limit_r):
+                    continue
+                if cc not in cols:
+                    continue
+                try:
+                    cur = getattr(cell, "alignment", None)
+                    if cur is not None:
+                        try:
+                            cell.alignment = cur.copy(wrapText=True)
+                        except Exception:
+                            cell.alignment = Alignment(wrapText=True)
+                    else:
+                        cell.alignment = Alignment(wrapText=True)
+                except Exception:
+                    continue
+
         for form_key in ("1", "2", "2c", "3"):
             viewer = self._form_viewers.get(form_key)
             sheet_name = self._form_sheet_names.get(form_key)
@@ -3871,37 +4099,29 @@ class MainWindow(QMainWindow):
                 _set_default_if_blank("D7", "A/NA/Stamp #")
                 _set_default_if_blank("E9", "XXXXXXXXXX/xxxxx")
                 _set_default_if_blank("D9", "10033672")
+
+                # Requested default: Wrap Text for Columns C, D, E on Form 1.
+                try:
+                    max_r = int(getattr(ws, "max_row", 0) or 0)
+                except Exception:
+                    max_r = 0
+                _apply_default_wrap_columns(ws, [3, 4, 5], max_rows=min(max(max_r, 200), 1500))
             elif form_key == "2":
                 self._ensure_supplier_directory_dropdown(ws, cell_range="F5:F500")
 
-                # Requested default: Wrap Text for Column D on Form 2.
+                # Requested default: Wrap Text for Columns C, D, F on Form 2.
                 try:
-                    from openpyxl.styles import Alignment
+                    max_r = int(getattr(ws, "max_row", 0) or 0)
                 except Exception:
-                    Alignment = None
-
-                if Alignment is not None:
-                    # Limit rows for performance; templates can have a lot of formatting.
-                    try:
-                        max_r = int(getattr(ws, "max_row", 0) or 0)
-                    except Exception:
-                        max_r = 0
-                    max_r = max(max_r, 200)
-                    max_r = min(max_r, 1000)
-                    col = 4  # D
-                    for rr in range(1, int(max_r) + 1):
-                        try:
-                            cell = ws.cell(row=int(rr), column=int(col))
-                            cur = getattr(cell, "alignment", None)
-                            if cur is not None:
-                                try:
-                                    cell.alignment = cur.copy(wrapText=True)
-                                except Exception:
-                                    cell.alignment = Alignment(wrapText=True)
-                            else:
-                                cell.alignment = Alignment(wrapText=True)
-                        except Exception:
-                            continue
+                    max_r = 0
+                _apply_default_wrap_columns(ws, [3, 4, 6], max_rows=min(max(max_r, 200), 1500))
+            elif form_key == "3":
+                # Requested default: Wrap Text for Columns G and M on Form 3.
+                try:
+                    max_r = int(getattr(ws, "max_row", 0) or 0)
+                except Exception:
+                    max_r = 0
+                _apply_default_wrap_columns(ws, [7, 13], max_rows=min(max(max_r, 300), 3000))
             viewer.set_worksheet(ws)
             # Persist any existing Calypso data into Form 3 worksheet.
             if form_key == "3" and self.characteristics:
@@ -5030,9 +5250,32 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-            if not getattr(char, "description", None) or not str(char.description).strip():
+            description_text = f"{getattr(char, 'id', '')}".strip()
+            if not description_text:
                 continue
-            if "nan" in str(char.description).lower():
+
+            spec_text = ""
+            try:
+                spec_text = str(getattr(char, "description", "") or "").strip()
+            except Exception:
+                spec_text = ""
+
+            # Skip rows with NaN-like spec text.
+            if spec_text and "nan" in spec_text.lower():
+                continue
+
+            # Historically, the form skipped rows with blank spec text.
+            # Keep skipping blank calypso rows, but allow derived/attribute rows
+            # to render (they intentionally may have a blank specification).
+            try:
+                src = str(getattr(char, "source", "calypso") or "calypso").strip().lower()
+            except Exception:
+                src = "calypso"
+            try:
+                is_attr = bool(getattr(char, "is_attribute", False))
+            except Exception:
+                is_attr = False
+            if not spec_text and src == "calypso" and not is_attr:
                 continue
 
             row_num += 1
@@ -5058,7 +5301,6 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-            description_text = f"{getattr(char, 'id', '')}".strip()
             desc_cell = ws.cell(row=current_row, column=7)
             desc_cell.value = description_text
             try:
@@ -5066,7 +5308,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 # If the openpyxl Alignment API differs, fall back to a simple wrap.
                 desc_cell.alignment = Alignment(wrap_text=True)
-            ws.cell(row=current_row, column=8).value = char.description
+            ws.cell(row=current_row, column=8).value = spec_text
 
             basic_text = " ".join(
                 [
@@ -5369,8 +5611,7 @@ class MainWindow(QMainWindow):
         bubble_zones = {}
         ref_mode = "sheet_zone"
         try:
-            dv = getattr(self, "drawing_viewer_tab", None)
-            pv = getattr(dv, "_pdf_viewer", None) if dv is not None else None
+            pv = self._get_active_drawing_pdf_viewer()
             if pv is not None and hasattr(pv, "reference_location_mode"):
                 ref_mode = str(getattr(pv, "reference_location_mode", "sheet_zone") or "sheet_zone")
             if pv is not None and hasattr(pv, "get_reference_locations"):
@@ -5379,6 +5620,23 @@ class MainWindow(QMainWindow):
                 bubble_zones = pv.get_bubble_zones()
         except Exception:
             pass
+
+        def _looks_like_auto_reference_location(s: str) -> bool:
+            s = str(s or "").strip()
+            if not s:
+                return False
+            # Auto page labels look like "PAGE 2".
+            if re.match(r"^\s*page\s*\d+\s*$", s, flags=re.IGNORECASE):
+                return True
+            # Auto zone labels look like "SH1 A1" or "A1-B1 C3" etc.
+            # Conservative match: optional SH prefix + tokens of [A-D][1-8] with optional ranges.
+            if re.match(
+                r"^\s*(?:SH\d+\s+)?(?:[A-D][1-8](?:-[A-D][1-8])?)(?:\s+[A-D][1-8](?:-[A-D][1-8])?)*\s*$",
+                s,
+                flags=re.IGNORECASE,
+            ):
+                return True
+            return False
 
         # Update fills based on the bubble number in column 5 (E).
         for rr in range(int(start_row), int(end_row) + 1):
@@ -5456,12 +5714,17 @@ class MainWindow(QMainWindow):
                     else:
                         ws.cell(row=rr, column=4).fill = PatternFill(start_color=green_rgb, end_color=green_rgb, fill_type="solid")
                 else:
-                    # Bubble is missing on the drawing: do not leave a populated Reference Location.
+                    # Bubble is missing on the drawing.
+                    # Do NOT wipe user/CHR-provided reference locations; only clear
+                    # values that look auto-generated (zone/page) so stale values
+                    # don't linger when a bubble was removed.
                     try:
-                        if viewer is not None and hasattr(viewer, "_apply_cell_value"):
-                            viewer._apply_cell_value(rr, 4, "", push_undo=False)
-                        else:
-                            ws.cell(row=rr, column=4).value = ""
+                        cur_val = ws.cell(row=rr, column=4).value
+                        if _looks_like_auto_reference_location(str(cur_val or "")):
+                            if viewer is not None and hasattr(viewer, "_apply_cell_value"):
+                                viewer._apply_cell_value(rr, 4, "", push_undo=False)
+                            else:
+                                ws.cell(row=rr, column=4).value = ""
                     except Exception:
                         pass
                     # Update Color (Red)
@@ -6389,6 +6652,37 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Form 3", "Form 3 worksheet is not available in the loaded template.")
             return
 
+        # Ask how many rows to insert.
+        try:
+            default_n = int(self._settings.value("forms/3/insert_rows_count", 1, type=int))
+        except Exception:
+            default_n = 1
+        default_n = max(1, min(100, int(default_n or 1)))
+        prompt_where = "above" if where == "above" else "below"
+        try:
+            n, ok = QInputDialog.getInt(
+                self,
+                "Insert Rows",
+                f"How many rows to insert {prompt_where}?",
+                int(default_n),
+                1,
+                100,
+                1,
+            )
+        except Exception:
+            n, ok = (1, True)
+        if not ok:
+            return
+        try:
+            n = int(n)
+        except Exception:
+            n = 1
+        n = max(1, min(100, int(n)))
+        try:
+            self._settings.setValue("forms/3/insert_rows_count", int(n))
+        except Exception:
+            pass
+
         # Snapshot for Ctrl+Z undo.
         try:
             print("Form3 delete (multi): calling _push_form3_undo_state")
@@ -6418,56 +6712,60 @@ class MainWindow(QMainWindow):
 
         # Insert row and best-effort copy formatting from an adjacent row.
         try:
-            ws.insert_rows(insert_at, 1)
+            ws.insert_rows(insert_at, int(n))
         except Exception as e:
             QMessageBox.warning(self, "Insert Failed", f"Could not insert row into Form 3:\n{e}")
             return
 
         try:
+            # Pick a stable formatting source row that is not inside the inserted block.
             if where == "above":
-                src_row = insert_at + 1
+                # After insertion, the original row_1based content is pushed down by n rows.
+                src_row = insert_at + int(n)
             else:
                 src_row = max(1, insert_at - 1)
             max_col = int(getattr(ws, "max_column", 0) or 0)
             if max_col <= 0:
                 max_col = 50
-            for cc in range(1, max_col + 1):
+            for rr in range(int(insert_at), int(insert_at) + int(n)):
+                for cc in range(1, max_col + 1):
+                    try:
+                        src = ws.cell(row=int(src_row), column=int(cc))
+                        dst = ws.cell(row=int(rr), column=int(cc))
+                        # Copy style-related attributes (best effort) but DO NOT copy fill,
+                        # since Form 3 uses dynamic red/green fills and copying them causes
+                        # confusing "red bleed" on inserted rows.
+                        for attr in ("font", "border", "alignment", "number_format", "protection"):
+                            try:
+                                v = getattr(src, attr, None)
+                                if v is not None:
+                                    setattr(dst, attr, copy.copy(v))
+                            except Exception:
+                                continue
+                    except Exception:
+                        continue
                 try:
-                    src = ws.cell(row=int(src_row), column=int(cc))
-                    dst = ws.cell(row=int(insert_at), column=int(cc))
-                    # Copy style-related attributes (best effort) but DO NOT copy fill,
-                    # since Form 3 uses dynamic red/green fills and copying them causes
-                    # confusing "red bleed" on inserted rows.
-                    for attr in ("font", "border", "alignment", "number_format", "protection"):
-                        try:
-                            v = getattr(src, attr, None)
-                            if v is not None:
-                                setattr(dst, attr, copy.copy(v))
-                        except Exception:
-                            continue
+                    ws.row_dimensions[int(rr)].height = ws.row_dimensions[int(src_row)].height
                 except Exception:
-                    continue
-            try:
-                ws.row_dimensions[int(insert_at)].height = ws.row_dimensions[int(src_row)].height
-            except Exception:
-                pass
+                    pass
         except Exception:
             pass
 
         # Ensure inserted row starts clean: no Reference Location and no copied fills.
-        try:
-            ws.cell(row=int(insert_at), column=4).value = ""
-        except Exception:
-            pass
-        try:
-            # Clear fills on Char No (B) and Notes (G) if they were copied/merged.
-            ws.cell(row=int(insert_at), column=2).fill = PatternFill()
-        except Exception:
-            pass
-        try:
-            ws.cell(row=int(insert_at), column=7).fill = PatternFill()
-        except Exception:
-            pass
+        for rr in range(int(insert_at), int(insert_at) + int(n)):
+            try:
+                ws.cell(row=int(rr), column=4).value = ""
+            except Exception:
+                pass
+            try:
+                # Clear fills on Char No (B) and Notes (G) if they were copied/merged.
+                ws.cell(row=int(rr), column=2).fill = PatternFill()
+            except Exception:
+                pass
+            try:
+                ws.cell(row=int(rr), column=7).fill = PatternFill()
+            except Exception:
+                pass
 
         # Refresh Form 3 shading and ensure Reference Location stays blank for missing bubbles.
         try:
@@ -6478,12 +6776,18 @@ class MainWindow(QMainWindow):
         # If the inserted row's bubble number falls inside an existing drawing range
         # bubble (e.g. 14-28), it should be treated as "missing" until the user adds
         # its own bubble. Exclude it from any range bubbles.
-        inserted_bubble_num = None
+        inserted_bubble_nums: set[int] = set()
         try:
-            v = ws.cell(row=int(insert_at), column=5).value
-            inserted_bubble_num = int(v)
+            for rr in range(int(insert_at), int(insert_at) + int(n)):
+                try:
+                    v = ws.cell(row=int(rr), column=5).value
+                    nn = int(v)
+                    if nn > 0:
+                        inserted_bubble_nums.add(int(nn))
+                except Exception:
+                    continue
         except Exception:
-            inserted_bubble_num = None
+            inserted_bubble_nums = set()
 
         try:
             self._apply_bubble_number_mapping_to_drawing(mapping)
@@ -6491,17 +6795,15 @@ class MainWindow(QMainWindow):
             pass
 
         try:
-            if inserted_bubble_num is not None and inserted_bubble_num > 0:
-                dv = getattr(self, "drawing_viewer_tab", None)
-                pv = getattr(dv, "_pdf_viewer", None) if dv is not None else None
+            if inserted_bubble_nums:
+                pv = self._get_active_drawing_pdf_viewer()
                 if pv is not None and hasattr(pv, "exclude_numbers_from_ranges"):
-                    pv.exclude_numbers_from_ranges({int(inserted_bubble_num)})
+                    pv.exclude_numbers_from_ranges(set(int(x) for x in inserted_bubble_nums))
         except Exception:
             pass
 
         try:
-            dv = getattr(self, "drawing_viewer_tab", None)
-            pv = getattr(dv, "_pdf_viewer", None) if dv is not None else None
+            pv = self._get_active_drawing_pdf_viewer()
             if pv is not None and hasattr(pv, "set_pending_bubble_number_to_lowest_available"):
                 pv.set_pending_bubble_number_to_lowest_available()
         except Exception:
@@ -6615,8 +6917,7 @@ class MainWindow(QMainWindow):
 
         # Remove the deleted bubble number (single-bubble items only), then remap the rest.
         try:
-            dv = getattr(self, "drawing_viewer_tab", None)
-            pv = getattr(dv, "_pdf_viewer", None) if dv is not None else None
+            pv = self._get_active_drawing_pdf_viewer()
             if pv is not None and deleted_bubble_num is not None and hasattr(pv, "delete_bubbles_with_numbers"):
                 pv.delete_bubbles_with_numbers({int(deleted_bubble_num)})
         except Exception:
@@ -7168,6 +7469,124 @@ class MainWindow(QMainWindow):
     def _apply_bubble_number_mapping_to_drawing(self, mapping: dict[int, int]) -> None:
         if not mapping:
             return
+
+        # Apply to both embedded + pop-out drawing viewers (whichever exist).
+        for viewer_attr in ("drawing_viewer_tab", "pdf_window"):
+            try:
+                w = getattr(self, viewer_attr, None)
+                pv = getattr(w, "_pdf_viewer", None) if w is not None else None
+                if pv is None:
+                    continue
+                if hasattr(pv, "apply_bubble_number_mapping"):
+                    pv.apply_bubble_number_mapping(dict(mapping))
+            except Exception:
+                continue
+
+    def _form3_detect_start_row(self, ws) -> int:
+        """Best-effort detection of Form 3 data start row (1-based)."""
+        start_row = 6
+        try:
+            for r in range(1, 60):
+                val = ws.cell(row=r, column=2).value
+                if val and "char no" in str(val).lower():
+                    start_row = int(r) + 1
+                    # If the next row still looks like header content, skip it.
+                    try:
+                        row_text = " ".join(
+                            [
+                                str(ws.cell(row=start_row, column=c).value or "")
+                                for c in range(1, min(int(getattr(ws, "max_column", 0) or 0), 30) + 1)
+                            ]
+                        ).lower()
+                        if "op #" in row_text or "op#" in row_text or "reference location" in row_text or "bubble" in row_text:
+                            start_row = int(r) + 2
+                    except Exception:
+                        pass
+                    break
+        except Exception:
+            start_row = 6
+        return max(1, int(start_row))
+
+    def _trim_form3_sheet_after_calypso_load(self, ws, *, keep_blank_rows: int = 50) -> None:
+        """Trim Form 3 sheet size after loading a new Calypso/CHR file.
+
+        - Detect the last row that contains any Form 3 data.
+        - Ensure there are `keep_blank_rows` rows after it.
+        - Delete every row after that.
+        - Delete columns AA and higher.
+        """
+        if ws is None:
+            return
+        try:
+            keep_blank_rows = int(keep_blank_rows)
+        except Exception:
+            keep_blank_rows = 50
+        keep_blank_rows = max(0, min(int(keep_blank_rows), 500))
+
+        start_row = self._form3_detect_start_row(ws)
+
+        # Determine last data row using existing populated cells only (fast).
+        last_data_row = start_row
+        try:
+            cells = list(getattr(ws, "_cells", {}).items())
+        except Exception:
+            cells = []
+
+        # Consider columns A–T as "Form 3" data region, plus M explicitly.
+        # (AA+ will be deleted below.)
+        max_data_col = 20
+        for (r, c), cell in cells:
+            try:
+                rr = int(r)
+                cc = int(c)
+            except Exception:
+                continue
+            if rr < int(start_row):
+                continue
+            if cc <= 0 or cc > int(max_data_col):
+                continue
+            try:
+                v = getattr(cell, "value", None)
+            except Exception:
+                v = None
+            if v is None:
+                continue
+            if isinstance(v, str) and not v.strip():
+                continue
+            if rr > last_data_row:
+                last_data_row = int(rr)
+
+        target_last_row = int(last_data_row) + int(keep_blank_rows)
+        if target_last_row < start_row:
+            target_last_row = int(start_row)
+
+        # Delete rows after target_last_row.
+        try:
+            cur_max = int(getattr(ws, "max_row", 0) or 0)
+        except Exception:
+            cur_max = 0
+        if cur_max > int(target_last_row):
+            try:
+                ws.delete_rows(int(target_last_row) + 1, int(cur_max) - int(target_last_row))
+            except Exception:
+                pass
+        elif cur_max and cur_max < int(target_last_row):
+            # Rare: extend sheet to keep the requested blank rows.
+            try:
+                ws.insert_rows(int(cur_max) + 1, int(target_last_row) - int(cur_max))
+            except Exception:
+                pass
+
+        # Delete columns AA (27) and higher.
+        try:
+            cur_max_col = int(getattr(ws, "max_column", 0) or 0)
+        except Exception:
+            cur_max_col = 0
+        if cur_max_col >= 27:
+            try:
+                ws.delete_cols(27, int(cur_max_col) - 26)
+            except Exception:
+                pass
         try:
             dvw = getattr(self, "drawing_viewer_tab", None)
             pv = getattr(dvw, "_pdf_viewer", None) if dvw is not None else None
@@ -7844,6 +8263,12 @@ class MainWindow(QMainWindow):
         self._set_drawing_pdf_path(p, load_viewer=True)
 
     def load_chr(self, path):
+        # Per request: whenever a Calypso file is selected/loaded, force the
+        # Form 3 auto-add option to start unchecked.
+        try:
+            self._set_form3_include_thread_extras(False, persist=True, update_ui=True)
+        except Exception:
+            pass
         self.chr_path_edit.setText(path)
         self._settings.setValue("paths/chr", path)
         self.characteristics = self.parser.parse_file(path)
@@ -7859,6 +8284,10 @@ class MainWindow(QMainWindow):
         if self._template_wb is not None and self._form_sheet_names.get("3") and self._form_viewers.get("3"):
             ws = self._template_wb[self._form_sheet_names["3"]]
             self._write_form3_to_worksheet(ws)
+            try:
+                self._trim_form3_sheet_after_calypso_load(ws, keep_blank_rows=50)
+            except Exception:
+                pass
             self._form_viewers["3"].set_overrides({})
             self._form_viewers["3"].render()
             # The Form 3 table may have just gained bubble numbers; re-sync fills.
@@ -8102,9 +8531,9 @@ class MainWindow(QMainWindow):
         fix = (
             "\n"
             "QPushButton, QToolButton {\n"
-            "  padding: 4px 10px;\n"
-            "  min-height: 24px;\n"
-            "  border-radius: 6px;\n"
+            "  padding: 2px 8px;\n"
+            "  min-height: 22px;\n"
+            "  border-radius: 4px;\n"
             "}\n"
             "QPushButton {\n"
             "  border: 1px solid palette(mid);\n"

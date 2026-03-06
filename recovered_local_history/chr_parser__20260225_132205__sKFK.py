@@ -43,6 +43,11 @@ class ChrParser:
             r'\bNPT\b', r'\bNPTF\b',
             r'\bBSP\b', r'\bBSPT\b',
             r'\bSTI\b',
+            # Some exports/notes use shorthand that still indicates a thread.
+            # Per request: treat these as thread triggers when present in the
+            # Description/Note text.
+            r'\bMN\b',
+            r'\bMINOR\b',
             r'\bACME\b', r'\bSTUB ACME\b',
             r'\bWHITWORTH\b'
         ]
@@ -225,17 +230,12 @@ class ChrParser:
             expanded.append(char)
             
             if char.is_thread and not char.is_attribute:
-                # 1. Add Go/No Go Check
-                base_id = str(getattr(char, "id", "") or "").strip()
-                base_feat = str(getattr(char, "feature_name", "") or "").strip()
-                # Form 3 uses `id` as the Description/Note text; keep this human-readable.
-                gng_label = (base_id + " Go/No Go").strip() if base_id else "Go/No Go"
-                go_no_go = FaiCharacteristic(
-                    id=gng_label,
-                    feature_name=(base_feat + " Go/No Go").strip() if base_feat else "Go/No Go",
-                    # Leave specification blank; this is an attribute check row.
-                    description="",
-                    actual="", # User to fill or default to Pass
+                # 1. Add Go / No-Go checks (two lines)
+                go_gage = FaiCharacteristic(
+                    id=f"{char.id}_GO",
+                    feature_name=f"{char.feature_name} GO".strip(),
+                    description="GO Gage",
+                    actual="",  # User to fill
                     nominal="Pass",
                     upper_tol="",
                     lower_tol="",
@@ -244,9 +244,26 @@ class ChrParser:
                     group1=char.group1,
                     source="derived",
                     is_attribute=True,
-                    is_thread=True
+                    is_thread=True,
                 )
-                expanded.append(go_no_go)
+                expanded.append(go_gage)
+
+                no_go_gage = FaiCharacteristic(
+                    id=f"{char.id}_NOGO",
+                    feature_name=f"{char.feature_name} NO-GO".strip(),
+                    description="NO-GO Gage",
+                    actual="",  # User to fill
+                    nominal="Pass",
+                    upper_tol="",
+                    lower_tol="",
+                    type="Attribute",
+                    unit=char.unit,
+                    group1=char.group1,
+                    source="derived",
+                    is_attribute=True,
+                    is_thread=True,
+                )
+                expanded.append(no_go_gage)
                 
                 # 2. Add Minor Diameter Check
                 # Check if a "Minor" feature already exists for this thread.
@@ -254,6 +271,9 @@ class ChrParser:
                 
                 # If the current char description says "Minor", don't add another.
                 if "minor" in char.feature_name.lower() or "minor" in char.id.lower():
+                    found_minor = True
+                if (not found_minor) and ("mn" in str(char.feature_name or "").lower() or "mn" in str(char.id or "").lower()):
+                    # Common shorthand seen in some callouts/notes.
                     found_minor = True
 
                 if not found_minor:
@@ -272,12 +292,10 @@ class ChrParser:
                                  break
 
                 if not found_minor:
-                    minor_label = (base_id + " Minor Diameter").strip() if base_id else "Minor Diameter"
                     minor_dia = FaiCharacteristic(
-                        id=minor_label,
-                        feature_name=(base_feat + " Minor Diameter").strip() if base_feat else "Minor Diameter",
-                        # Leave specification blank; this is an attribute check row.
-                        description="",
+                        id=f"{char.id}_MIN",
+                        feature_name=f"{char.feature_name} Minor Dia",
+                        description="Minor Diameter Check",
                         actual="", 
                         nominal="",
                         upper_tol="",

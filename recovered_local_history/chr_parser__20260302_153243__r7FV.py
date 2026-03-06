@@ -226,15 +226,10 @@ class ChrParser:
             
             if char.is_thread and not char.is_attribute:
                 # 1. Add Go/No Go Check
-                base_id = str(getattr(char, "id", "") or "").strip()
-                base_feat = str(getattr(char, "feature_name", "") or "").strip()
-                # Form 3 uses `id` as the Description/Note text; keep this human-readable.
-                gng_label = (base_id + " Go/No Go").strip() if base_id else "Go/No Go"
                 go_no_go = FaiCharacteristic(
-                    id=gng_label,
-                    feature_name=(base_feat + " Go/No Go").strip() if base_feat else "Go/No Go",
-                    # Leave specification blank; this is an attribute check row.
-                    description="",
+                    id=f"{char.id}_GNG",
+                    feature_name=f"{char.feature_name} Go/No Go",
+                    description="Thread Attribute",
                     actual="", # User to fill or default to Pass
                     nominal="Pass",
                     upper_tol="",
@@ -272,23 +267,58 @@ class ChrParser:
                                  break
 
                 if not found_minor:
-                    minor_label = (base_id + " Minor Diameter").strip() if base_id else "Minor Diameter"
                     minor_dia = FaiCharacteristic(
-                        id=minor_label,
-                        feature_name=(base_feat + " Minor Diameter").strip() if base_feat else "Minor Diameter",
-                        # Leave specification blank; this is an attribute check row.
-                        description="",
+                        id=f"{char.id}_MIN",
+                        feature_name=f"{char.feature_name} Minor Dia",
+                        description="Minor Diameter Check",
                         actual="", 
                         nominal="",
                         upper_tol="",
                         lower_tol="",
-                        type="Attribute", 
-                        unit=char.unit,
-                        group1=char.group1,
-                        source="derived",
-                        is_attribute=True,
-                        is_thread=True
-                    )
-                    expanded.append(minor_dia)
-                
-        return expanded
+                            if char.is_thread and (not char.is_attribute) and str(getattr(char, "source", "calypso") or "calypso").strip().lower() == "calypso":
+                                # Add two derived rows immediately below the thread row.
+                                # These should:
+                                # - copy the original Name (Calypso ID text) and append the suffix
+                                # - inherit Location (group1), unit, and comment
+                                # - be attribute-style checks (user fills Pass/Fail)
+
+                                base_name = str(char.id or "").strip()
+                                go_no_go_name = (base_name + " Go/No Go").strip() if base_name else "Go/No Go"
+                                minor_dia_name = (base_name + " Minor Diameter").strip() if base_name else "Minor Diameter"
+
+                                go_no_go = FaiCharacteristic(
+                                    id=go_no_go_name,
+                                    feature_name=str(char.feature_name or "").strip(),
+                                    # Requirement column in Form 3: keep a non-empty value so the row is not skipped.
+                                    description="Pass",
+                                    actual="",
+                                    nominal="Pass",
+                                    upper_tol="",
+                                    lower_tol="",
+                                    type="Attribute",
+                                    unit=str(char.unit or ""),
+                                    group1=str(char.group1 or ""),
+                                    source="derived",
+                                    is_attribute=True,
+                                    is_thread=True,
+                                    comment=str(getattr(char, "comment", "") or ""),
+                                )
+                                expanded.append(go_no_go)
+
+                                minor_dia = FaiCharacteristic(
+                                    id=minor_dia_name,
+                                    feature_name=str(char.feature_name or "").strip(),
+                                    description="Pass",
+                                    actual="",
+                                    nominal="Pass",
+                                    upper_tol="",
+                                    lower_tol="",
+                                    type="Attribute",
+                                    unit=str(char.unit or ""),
+                                    group1=str(char.group1 or ""),
+                                    source="derived",
+                                    is_attribute=True,
+                                    is_thread=True,
+                                    comment=str(getattr(char, "comment", "") or ""),
+                                )
+                                expanded.append(minor_dia)

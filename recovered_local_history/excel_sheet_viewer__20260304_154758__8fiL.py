@@ -9,7 +9,7 @@ import logging
 
 from PySide6.QtCore import Qt, QEvent, QPoint, QTimer, Signal, QSignalBlocker, QItemSelection, QItemSelectionModel, QRect
 from PySide6.QtGui import QColor, QFont, QPen, QGuiApplication, QKeySequence, QShortcut, QPalette, QTextOption, QFontMetrics
-from PySide6.QtWidgets import QAbstractItemView, QAbstractItemDelegate, QStyledItemDelegate, QTableWidget, QTableWidgetItem, QWidget, QVBoxLayout, QMenu, QStyleOptionViewItem, QStyle, QTableWidgetSelectionRange, QTextEdit
+from PySide6.QtWidgets import QAbstractItemView, QAbstractItemDelegate, QStyledItemDelegate, QTableWidget, QTableWidgetItem, QWidget, QVBoxLayout, QMenu, QStyleOptionViewItem, QStyle, QTableWidgetSelectionRange, QTextEdit, QInputDialog
 
 from openpyxl.styles import PatternFill
 
@@ -529,11 +529,41 @@ class ExcelSheetViewer(QWidget):
             return
         if act_above is not None and chosen == act_above:
             try:
+                n, ok = QInputDialog.getInt(
+                    self.table,
+                    "Insert rows",
+                    "How many lines to add?",
+                    1,
+                    1,
+                    500,
+                    1,
+                )
+                if not ok:
+                    return
+                try:
+                    self._pending_row_insert_count = int(n)
+                except Exception:
+                    self._pending_row_insert_count = 1
                 self.rowInsertRequested.emit(int(row_1based), "above")
             except Exception:
                 pass
         elif act_below is not None and chosen == act_below:
             try:
+                n, ok = QInputDialog.getInt(
+                    self.table,
+                    "Insert rows",
+                    "How many lines to add?",
+                    1,
+                    1,
+                    500,
+                    1,
+                )
+                if not ok:
+                    return
+                try:
+                    self._pending_row_insert_count = int(n)
+                except Exception:
+                    self._pending_row_insert_count = 1
                 self.rowInsertRequested.emit(int(row_1based), "below")
             except Exception:
                 pass
@@ -1179,34 +1209,83 @@ class ExcelSheetViewer(QWidget):
         if max_c < min_c:
             min_c, max_c = max_c, min_c
 
-        cols0 = {c - 1 for c in range(min_c, max_c + 1)}
+        # Prefer the configured auto-fit columns when present.
+        # This is a big speedup vs scanning A–T when only a couple columns wrap.
+        if self._auto_fit_row_height_cols:
+            cols0 = {int(c0) for c0 in self._auto_fit_row_height_cols if (min_c - 1) <= int(c0) <= (max_c - 1)}
+            if not cols0:
+                cols0 = {c - 1 for c in range(min_c, max_c + 1)}
+        else:
+            cols0 = {c - 1 for c in range(min_c, max_c + 1)}
 
         effective = self._fit_scale * self._user_zoom
         effective = max(self.MIN_EFFECTIVE_SCALE, min(effective, self.MAX_EFFECTIVE_SCALE))
         if effective <= 0:
             effective = 1.0
 
-        fm_cache: dict[tuple, QFontMetrics] = {}
-        colw_cache: dict[int, int] = {}
+        # Fast path: only fit rows up to the last row that has any text
+        # in the columns we're considering.
+        last_r0 = -1
+        try:
+            for r0 in range(self.table.rowCount() - 1, -1, -1):
+                for c0 in cols0:
+                    if c0 < 0 or c0 >= self.table.columnCount():
+                        continue
+                    it = self.table.item(int(r0), int(c0))
+                    if it is None:
+                        continue
+                    if (it.text() or "").strip():
+                        last_r0 = int(r0)
+                        break
+                if last_r0 >= 0:
+                    break
+        except Exception:
+            last_r0 = self.table.rowCount() - 1
+
+        if last_r0 < 0:
+            return
 
         self._suppress_resize_handlers = True
         try:
-            with QSignalBlocker(self.table.verticalHeader()):
-                for r0 in range(self.table.rowCount()):
-                    desired_px = self._compute_row_height_px(int(r0), cols0, fm_cache=fm_cache, colw_cache=colw_cache)
-                    if desired_px is None:
-                        continue
-                    try:
-                        self.table.setRowHeight(int(r0), int(desired_px))
-                    except Exception:
-                        pass
+            # Disable repaints while applying row height changes; this is a big
+            # speedup for large sheets.
+            try:
+                self.table.setUpdatesEnabled(False)
+            except Exception:
+                pass
+            try:
+                with QSignalBlocker(self.table.verticalHeader()):
+                    for r0 in range(int(last_r0) + 1):
+                        desired_px = self._compute_row_height_px(int(r0), cols0)
+                        if desired_px is None:
+                            continue
 
-                    if 0 <= int(r0) < len(self._base_row_heights):
-                        self._base_row_heights[int(r0)] = max(self._base_row_heights[int(r0)], int(int(desired_px) / effective))
-                    else:
-                        while len(self._base_row_heights) <= int(r0):
-                            self._base_row_heights.append(max(1, int(int(desired_px) / effective)))
-                        self._base_row_heights[int(r0)] = max(1, int(int(desired_px) / effective))
+                        try:
+                            cur_px = int(self.table.rowHeight(int(r0)))
+                        except Exception:
+                            cur_px = -1
+
+                        # Avoid redundant UI work.
+                        if cur_px >= 0 and abs(int(cur_px) - int(desired_px)) <= 1:
+                            continue
+
+                        try:
+                            self.table.setRowHeight(int(r0), int(desired_px))
+                        except Exception:
+                            pass
+
+                        if 0 <= int(r0) < len(self._base_row_heights):
+                            self._base_row_heights[int(r0)] = max(self._base_row_heights[int(r0)], int(int(desired_px) / effective))
+                        else:
+                            while len(self._base_row_heights) <= int(r0):
+                                self._base_row_heights.append(max(1, int(int(desired_px) / effective)))
+                            self._base_row_heights[int(r0)] = max(1, int(int(desired_px) / effective))
+            finally:
+                try:
+                    self.table.setUpdatesEnabled(True)
+                    self.table.viewport().update()
+                except Exception:
+                    pass
         finally:
             self._suppress_resize_handlers = False
 
@@ -1280,181 +1359,257 @@ class ExcelSheetViewer(QWidget):
             return False
 
         ranges = list(self.table.selectedRanges() or [])
+        # Some selection gestures (e.g., clicking a column header) may not
+        # populate selectedRanges(); fall back to selected rows/cols.
+        selected_rows0: set[int] = set()
+        selected_cols0: set[int] = set()
         if not ranges:
-            return False
+            try:
+                sm = self.table.selectionModel()
+            except Exception:
+                sm = None
+            if sm is not None:
+                try:
+                    selected_cols0 = {int(ix.column()) for ix in (sm.selectedColumns() or [])}
+                except Exception:
+                    selected_cols0 = set()
+                try:
+                    selected_rows0 = {int(ix.row()) for ix in (sm.selectedRows() or [])}
+                except Exception:
+                    selected_rows0 = set()
+
+            # If headers were selected, expand to full row/column extents.
+            if selected_cols0 and not selected_rows0:
+                selected_rows0 = set(range(self.table.rowCount()))
+            if selected_rows0 and not selected_cols0:
+                selected_cols0 = set(range(self.table.columnCount()))
+
+            # Last resort: apply to current cell.
+            if not selected_rows0 and not selected_cols0:
+                try:
+                    cur = self.table.currentIndex()
+                except Exception:
+                    cur = None
+                if cur is not None and cur.isValid():
+                    selected_rows0 = {int(cur.row())}
+                    selected_cols0 = {int(cur.column())}
+                else:
+                    return False
 
         ws = self._ws
 
         try:
             from openpyxl.styles import Alignment
-            from openpyxl.cell.cell import MergedCell
         except Exception:
             return False
 
-        # Collect target cells (1-based). Use a set to avoid duplicates.
-        targets: set[tuple[int, int]] = set()
-        for rng in ranges:
-            r0 = int(rng.topRow()) + 1
-            r1 = int(rng.bottomRow()) + 1
-            c0 = int(rng.leftColumn()) + 1
-            c1 = int(rng.rightColumn()) + 1
-            for rr in range(r0, r1 + 1):
-                for cc in range(c0, c1 + 1):
-                    targets.add((rr, cc))
+        desired = bool(wrap)
 
-        def _top_left_for_merged(row: int, col: int) -> tuple[int, int]:
-            try:
-                for merged in list(getattr(ws.merged_cells, "ranges", []) or []):
-                    if merged.min_row <= row <= merged.max_row and merged.min_col <= col <= merged.max_col:
-                        return int(merged.min_row), int(merged.min_col)
-            except Exception:
-                pass
-            return row, col
+        # Precompute merged-cell -> top-left mapping (only for covered cells).
+        merged_tl: dict[tuple[int, int], tuple[int, int]] = {}
+        try:
+            for merged in list(getattr(ws.merged_cells, "ranges", []) or []):
+                tl = (int(merged.min_row), int(merged.min_col))
+                for rr in range(int(merged.min_row), int(merged.max_row) + 1):
+                    for cc in range(int(merged.min_col), int(merged.max_col) + 1):
+                        if (rr, cc) != tl:
+                            merged_tl[(rr, cc)] = tl
+        except Exception:
+            merged_tl = {}
+
+        # Cache alignment copies to avoid repeated .copy() overhead.
+        align_cache: dict[int, Alignment] = {}
 
         applied = False
-        affected_rows0: set[int] = set()
-        affected_cols0: set[int] = set()
-        for rr, cc in sorted(targets):
-            try:
-                cell = ws.cell(row=rr, column=cc)
-            except Exception:
-                continue
+        had_any_target = False
+        # Only auto-fit rows that actually contain text in affected columns.
+        rows_with_text0: set[int] = set()
+        changed_cols0: set[int] = set()
+        changed_rows0: set[int] = set()
+        updated_ws_cells: set[tuple[int, int]] = set()  # 1-based effective coords
 
-            if isinstance(cell, MergedCell) or cell.__class__.__name__ == "MergedCell":
-                rr2, cc2 = _top_left_for_merged(rr, cc)
-                try:
-                    cell = ws.cell(row=rr2, column=cc2)
-                except Exception:
-                    continue
-
-            try:
-                cur = getattr(cell, "alignment", None)
-                if cur is not None:
-                    try:
-                        cell.alignment = cur.copy(wrapText=bool(wrap))
-                    except Exception:
-                        cell.alignment = Alignment(wrapText=bool(wrap))
+        # Batch UI signals/updates; otherwise thousands of WRAP_ROLE changes can
+        # flood itemChanged and slow to a crawl.
+        old_prog = getattr(self, "_in_programmatic_change", False)
+        self._in_programmatic_change = True
+        self.table.setUpdatesEnabled(False)
+        try:
+            with QSignalBlocker(self.table):
+                # Iterate either ranges or header-selected rows/cols.
+                if ranges:
+                    iter_blocks = []
+                    for rng in ranges:
+                        iter_blocks.append((int(rng.topRow()), int(rng.bottomRow()), int(rng.leftColumn()), int(rng.rightColumn())))
                 else:
-                    cell.alignment = Alignment(wrapText=bool(wrap))
-                applied = True
-            except Exception:
-                continue
+                    # One block spanning explicit row/col sets (handled below).
+                    iter_blocks = [(0, 0, 0, 0)]
 
-            # Update visible item state.
+                for r0, r1, c0, c1 in iter_blocks:
+                    if ranges:
+                        row_iter = range(int(r0), int(r1) + 1)
+                        col_iter = range(int(c0), int(c1) + 1)
+                    else:
+                        row_iter = sorted(selected_rows0)
+                        col_iter = sorted(selected_cols0)
+
+                    for r0i in row_iter:
+                        rr = int(r0i) + 1
+                        for c0i in col_iter:
+                            cc = int(c0i) + 1
+                            had_any_target = True
+
+                            # Update visible item state first; use it as a fast
+                            # "already correct" check to avoid worksheet work.
+                            it = None
+                            try:
+                                it = self.table.item(int(r0i), int(c0i))
+                            except Exception:
+                                it = None
+                            if it is not None:
+                                try:
+                                    cur_wrap = bool(it.data(self.WRAP_ROLE))
+                                except Exception:
+                                    cur_wrap = False
+                                if cur_wrap == desired:
+                                    continue
+                                try:
+                                    it.setData(self.WRAP_ROLE, desired)
+                                except Exception:
+                                    pass
+                                applied = True
+                                changed_rows0.add(int(r0i))
+                                changed_cols0.add(int(c0i))
+                                try:
+                                    if (it.text() or "").strip():
+                                        rows_with_text0.add(int(r0i))
+                                except Exception:
+                                    pass
+                            else:
+                                # No item: fall back to worksheet update only.
+                                # (Should be rare; render usually creates items.)
+                                applied = True
+                                changed_rows0.add(int(r0i))
+                                changed_cols0.add(int(c0i))
+
+                            rr_eff, cc_eff = merged_tl.get((rr, cc), (rr, cc))
+                            eff_key = (int(rr_eff), int(cc_eff))
+                            if eff_key in updated_ws_cells:
+                                continue
+                            updated_ws_cells.add(eff_key)
+
+                            # Ensure the visible top-left item for merged cells
+                            # also gets the WRAP_ROLE so sizing behaves correctly.
+                            if (int(rr_eff), int(cc_eff)) != (int(rr), int(cc)):
+                                try:
+                                    it2 = self.table.item(int(rr_eff) - 1, int(cc_eff) - 1)
+                                    if it2 is not None:
+                                        it2.setData(self.WRAP_ROLE, desired)
+                                except Exception:
+                                    pass
+
+                            # Update worksheet alignment (preserve other fields).
+                            try:
+                                cell = ws._cells.get((int(rr_eff), int(cc_eff)))  # type: ignore[attr-defined]
+                            except Exception:
+                                cell = None
+                            if cell is None:
+                                try:
+                                    cell = ws.cell(row=int(rr_eff), column=int(cc_eff))
+                                except Exception:
+                                    continue
+
+                            try:
+                                cur = getattr(cell, "alignment", None)
+                                if cur is not None:
+                                    try:
+                                        if bool(getattr(cur, "wrapText", False)) == desired:
+                                            continue
+                                    except Exception:
+                                        pass
+                                    key = id(cur)
+                                    new_align = align_cache.get(key)
+                                    if new_align is None:
+                                        try:
+                                            new_align = cur.copy(wrapText=desired)
+                                        except Exception:
+                                            new_align = Alignment(wrapText=desired)
+                                        align_cache[key] = new_align
+                                    cell.alignment = new_align
+                                else:
+                                    cell.alignment = Alignment(wrapText=desired)
+                            except Exception:
+                                continue
+        finally:
             try:
-                it = self.table.item(int(rr) - 1, int(cc) - 1)
-                if it is not None:
-                    it.setData(self.WRAP_ROLE, bool(wrap))
+                self.table.setUpdatesEnabled(True)
             except Exception:
                 pass
-
-            try:
-                affected_rows0.add(int(rr) - 1)
-                affected_cols0.add(int(cc) - 1)
-            except Exception:
-                pass
+            self._in_programmatic_change = bool(old_prog)
 
         if applied:
-            # Fast path: only recompute row heights for affected rows.
-            # The previous implementation called resizeRowsToContents(), which can be
-            # very slow on large sheets.
+            # Excel-like behavior: wrap changes should expand/shrink row heights.
+            # Avoid resizeRowsToContents() (very slow on large sheets); instead
+            # auto-fit only the affected rows using the affected columns.
             try:
-                cols0 = {c for c in (affected_cols0 or set()) if 0 <= int(c) < self.table.columnCount() and not self.table.isColumnHidden(int(c))}
+                # Fit only rows that actually have text; otherwise row-height
+                # computations across thousands of empty rows become expensive.
+                base_rows = rows_with_text0 if rows_with_text0 else changed_rows0
+                rows_sorted = sorted({r for r in base_rows if 0 <= r < self.table.rowCount()})
+            except Exception:
+                rows_sorted = []
+            try:
+                cols0 = {c for c in changed_cols0 if 0 <= c < self.table.columnCount()}
             except Exception:
                 cols0 = set()
+            # Always include configured auto-fit columns to avoid clipping when
+            # the selection doesn't cover all wrapped-content columns.
+            try:
+                cols0 |= set(self._auto_fit_row_height_cols)
+            except Exception:
+                pass
 
-            if cols0:
-                try:
-                    effective = self._fit_scale * self._user_zoom
-                    effective = max(self.MIN_EFFECTIVE_SCALE, min(effective, self.MAX_EFFECTIVE_SCALE))
-                    if effective <= 0:
-                        effective = 1.0
-                except Exception:
+            if rows_sorted and cols0:
+                effective = self._fit_scale * self._user_zoom
+                effective = max(self.MIN_EFFECTIVE_SCALE, min(effective, self.MAX_EFFECTIVE_SCALE))
+                if effective <= 0:
                     effective = 1.0
-
-                fm_cache: dict[tuple, QFontMetrics] = {}
-                colw_cache: dict[int, int] = {}
-
-                def _metrics_for_font(f: QFont) -> QFontMetrics:
-                    key = (
-                        str(f.family()),
-                        float(f.pointSizeF()) if hasattr(f, "pointSizeF") else float(f.pointSize()),
-                        int(f.weight()),
-                        bool(f.italic()),
-                    )
-                    m = fm_cache.get(key)
-                    if m is None:
-                        m = QFontMetrics(f)
-                        fm_cache[key] = m
-                    return m
 
                 self._suppress_resize_handlers = True
                 try:
-                    with QSignalBlocker(self.table.verticalHeader()):
-                        for r0 in sorted({r for r in (affected_rows0 or set()) if 0 <= int(r) < self.table.rowCount()}):
-                            max_h = 0
-                            saw_text = False
-                            for c0 in cols0:
-                                it = self.table.item(int(r0), int(c0))
-                                if it is None:
+                    self.table.setUpdatesEnabled(False)
+                    try:
+                        with QSignalBlocker(self.table.verticalHeader()):
+                            cols0_set = set(cols0)
+                            for r0 in rows_sorted:
+                                desired_px = self._compute_row_height_px(int(r0), cols0_set)
+                                if desired_px is None:
                                     continue
-                                text = it.text() or ""
-                                if not text.strip():
+                                try:
+                                    before_h = int(self.table.rowHeight(int(r0)))
+                                except Exception:
+                                    before_h = -1
+                                if before_h >= 0 and abs(int(desired_px) - int(before_h)) <= 1:
                                     continue
-                                saw_text = True
                                 try:
-                                    wrap_flag = bool(it.data(self.WRAP_ROLE))
+                                    self.table.setRowHeight(int(r0), int(desired_px))
                                 except Exception:
-                                    wrap_flag = False
-                                try:
-                                    font = it.font() if it is not None else self.table.font()
-                                except Exception:
-                                    font = self.table.font()
-                                try:
-                                    fm = _metrics_for_font(font)
-                                    base_h = int(fm.height()) + 6
-                                except Exception:
-                                    fm = None
-                                    base_h = 18
-
-                                if wrap_flag and fm is not None:
-                                    col_w = colw_cache.get(int(c0))
-                                    if col_w is None:
-                                        try:
-                                            col_w = int(self.table.columnWidth(int(c0)))
-                                        except Exception:
-                                            col_w = 0
-                                        colw_cache[int(c0)] = int(col_w)
-                                    avail = max(int(col_w) - 8, 20)
-                                    try:
-                                        rect = fm.boundingRect(QRect(0, 0, int(avail), 10000), Qt.TextWordWrap, str(text))
-                                        h = int(rect.height()) + 6
-                                    except Exception:
-                                        h = base_h
-                                else:
-                                    h = base_h
-
-                                if int(h) > int(max_h):
-                                    max_h = int(h)
-
-                            if not saw_text:
-                                continue
-                            desired_px = max(int(max_h), 10)
-                            before_h = self.table.rowHeight(int(r0))
-                            if desired_px > before_h:
-                                self.table.setRowHeight(int(r0), int(desired_px))
+                                    pass
                                 if 0 <= int(r0) < len(self._base_row_heights):
-                                    self._base_row_heights[int(r0)] = max(self._base_row_heights[int(r0)], int(int(desired_px) / float(effective)))
+                                    self._base_row_heights[int(r0)] = max(
+                                        self._base_row_heights[int(r0)],
+                                        int(int(desired_px) / effective),
+                                    )
+                    finally:
+                        try:
+                            self.table.setUpdatesEnabled(True)
+                        except Exception:
+                            pass
                 finally:
                     self._suppress_resize_handlers = False
-            else:
-                # If we can't determine affected columns, at least refresh visible rows.
-                try:
-                    self._apply_row_height_visible()
-                except Exception:
-                    pass
 
-        return applied
+        # Return True if there was a valid selection target, even if no cells
+        # required a state change (prevents spurious "Please select" popups).
+        return bool(applied or had_any_target)
 
     def render(self) -> None:
         if self._ws is None:
@@ -1563,6 +1718,114 @@ class ExcelSheetViewer(QWidget):
                 return QColor(r, g, b)
             except Exception:
                 return None
+
+        # Row default backgrounds: for these forms, the template often only
+        # colors column A, but visually the entire row should carry that color.
+        # We treat column A's solid fill as the "row background" for any cells
+        # that otherwise have no fill.
+        row_default_bg: Dict[int, QColor] = {}
+        # Track solid fill colors so we can pick a sensible fallback background
+        # when column A provides no guidance.
+        #
+        # Important: body columns (e.g. bubble columns) can have a strong fill
+        # color that would dominate a full-sheet histogram (like the green seen
+        # on Form 3). We therefore prefer a histogram from the header area.
+        header_fill_counts: Dict[Tuple[int, int, int], int] = {}
+        fill_counts: Dict[Tuple[int, int, int], int] = {}
+        try:
+            for rr in range(1, max_row + 1):
+                if (rr, 1) in covered:
+                    continue
+                cell_a = ws.cell(row=rr, column=1)
+                fill_a = getattr(cell_a, "fill", None)
+                pt = None
+                if fill_a is not None:
+                    pt = getattr(fill_a, "patternType", None) or getattr(fill_a, "fill_type", None)
+                if fill_a and pt == "solid":
+                    c = _qcolor_from_openpyxl(getattr(fill_a, "fgColor", None) or getattr(fill_a, "start_color", None))
+                    if c is not None:
+                        row_default_bg[int(rr)] = c
+
+            # Build solid-fill histograms.
+            # - header_fill_counts: only the top rows (template header region)
+            # - fill_counts: whole used area (fallback)
+            # Only sample the true header region.
+            # In the AS9102 template, row 6 is where data starts; sampling
+            # deeper rows would let body highlight colors (e.g. auto-added
+            # thread rows) incorrectly become the sheet background.
+            header_rows = int(min(max_row, 5))
+            for rr in range(1, max_row + 1):
+                for cc in range(1, max_col + 1):
+                    if (rr, cc) in covered:
+                        continue
+                    try:
+                        cell = ws.cell(row=rr, column=cc)
+                    except Exception:
+                        continue
+                    fill = getattr(cell, "fill", None)
+                    pt = None
+                    if fill is not None:
+                        pt = getattr(fill, "patternType", None) or getattr(fill, "fill_type", None)
+                    if not fill or pt != "solid":
+                        continue
+                    qc = _qcolor_from_openpyxl(getattr(fill, "fgColor", None) or getattr(fill, "start_color", None))
+                    if qc is None:
+                        continue
+                    rgb_key = (int(qc.red()), int(qc.green()), int(qc.blue()))
+                    # Whole-sheet histogram: skip pure white so we don't
+                    # accidentally erase intended tinted backgrounds.
+                    if rgb_key != (255, 255, 255):
+                        fill_counts[rgb_key] = int(fill_counts.get(rgb_key, 0)) + 1
+                    # Header histogram: include white/near-white; for templates
+                    # like Form 3, the desired "sheet" color often matches the
+                    # header region rather than the body highlight columns.
+                    if rr <= header_rows:
+                        header_fill_counts[rgb_key] = int(header_fill_counts.get(rgb_key, 0)) + 1
+        except Exception:
+            row_default_bg = {}
+            header_fill_counts = {}
+            fill_counts = {}
+
+        # Also set the table palette so empty/unused areas match a sensible base.
+        # Priority:
+        # 1) First available column-A fill (if present)
+        # 2) Most common solid fill in the header area (top rows)
+        # 3) Most common non-white solid fill on the sheet (fallback)
+        sheet_default_bg: Optional[QColor] = None
+        try:
+            for rr in range(1, max_row + 1):
+                if rr in row_default_bg:
+                    sheet_default_bg = row_default_bg[rr]
+                    break
+        except Exception:
+            sheet_default_bg = None
+
+        if sheet_default_bg is None and header_fill_counts:
+            try:
+                (r, g, b), _n = max(header_fill_counts.items(), key=lambda kv: int(kv[1]))
+                sheet_default_bg = QColor(int(r), int(g), int(b))
+            except Exception:
+                sheet_default_bg = None
+
+        if sheet_default_bg is None and fill_counts:
+            try:
+                (r, g, b), _n = max(fill_counts.items(), key=lambda kv: int(kv[1]))
+                sheet_default_bg = QColor(int(r), int(g), int(b))
+            except Exception:
+                sheet_default_bg = None
+
+        if sheet_default_bg is not None:
+            try:
+                pal = QPalette(self.table.palette())
+                pal.setColor(QPalette.ColorRole.Base, sheet_default_bg)
+                pal.setColor(QPalette.ColorRole.Window, sheet_default_bg)
+                self.table.setPalette(pal)
+                try:
+                    self.table.viewport().setPalette(pal)
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
         def _ideal_text_color(bg: Optional[QColor]) -> Optional[QColor]:
             """Pick a readable text color when background is explicit."""
@@ -1688,11 +1951,17 @@ class ExcelSheetViewer(QWidget):
                 # Fill
                 bg = None
                 fill = getattr(cell, "fill", None)
-                if fill and getattr(fill, "patternType", None) == "solid":
-                    bg = _qcolor_from_openpyxl(getattr(fill, "fgColor", None))
+                pt = None
+                if fill is not None:
+                    pt = getattr(fill, "patternType", None) or getattr(fill, "fill_type", None)
+                if fill and pt == "solid":
+                    bg = _qcolor_from_openpyxl(getattr(fill, "fgColor", None) or getattr(fill, "start_color", None))
 
                 if override is not None and override.background is not None:
                     bg = override.background
+
+                if bg is None:
+                    bg = row_default_bg.get(int(r)) or sheet_default_bg
 
                 if bg is not None:
                     item.setBackground(bg)
@@ -2372,14 +2641,7 @@ class ExcelSheetViewer(QWidget):
         finally:
             self._suppress_resize_handlers = False
 
-    def _compute_row_height_px(
-        self,
-        row0: int,
-        cols0: set[int],
-        *,
-        fm_cache: dict[tuple, QFontMetrics] | None = None,
-        colw_cache: dict[int, int] | None = None,
-    ) -> int | None:
+    def _compute_row_height_px(self, row0: int, cols0: set[int]) -> int | None:
         """Compute desired row height based on cell text and wrap flags.
 
         Returns pixel height at current scale, or None if no text was found.
@@ -2391,22 +2653,6 @@ class ExcelSheetViewer(QWidget):
 
         max_h = 0
         saw_text = False
-
-        fm_cache = fm_cache if fm_cache is not None else {}
-        colw_cache = colw_cache if colw_cache is not None else {}
-
-        def _metrics_for_font(f: QFont) -> QFontMetrics:
-            key = (
-                str(f.family()),
-                float(f.pointSizeF()) if hasattr(f, "pointSizeF") else float(f.pointSize()),
-                int(f.weight()),
-                bool(f.italic()),
-            )
-            m = fm_cache.get(key)
-            if m is None:
-                m = QFontMetrics(f)
-                fm_cache[key] = m
-            return m
 
         for c0 in cols0:
             if c0 < 0 or c0 >= self.table.columnCount():
@@ -2427,7 +2673,7 @@ class ExcelSheetViewer(QWidget):
                 font = self.table.font()
 
             try:
-                fm = _metrics_for_font(font)
+                fm = QFontMetrics(font)
                 base_h = int(fm.height()) + 6
             except Exception:
                 fm = None
@@ -2444,18 +2690,20 @@ class ExcelSheetViewer(QWidget):
                 pass
 
             if wrap_flag:
-                col_w = colw_cache.get(int(c0))
-                if col_w is None:
-                    try:
-                        col_w = int(self.table.columnWidth(int(c0)))
-                    except Exception:
-                        col_w = 0
-                    colw_cache[int(c0)] = int(col_w)
+                try:
+                    col_w = int(self.table.columnWidth(int(c0)))
+                except Exception:
+                    col_w = 0
                 padding = 8
                 avail = max(int(col_w) - padding, 20)
                 if fm is not None and avail > 0:
                     try:
-                        rect = fm.boundingRect(QRect(0, 0, int(avail), 10000), Qt.TextWordWrap, str(text))
+                        flags = Qt.TextFlag.TextWordWrap
+                        try:
+                            flags |= Qt.TextFlag.TextWrapAnywhere
+                        except Exception:
+                            pass
+                        rect = fm.boundingRect(QRect(0, 0, int(avail), 10000), flags, str(text))
                         h = int(rect.height()) + 6
                     except Exception:
                         h = base_h
@@ -3260,6 +3508,15 @@ class _ExcelEditDelegate(QStyledItemDelegate):
         except Exception:
             wrap_flag = False
 
+        # We'll custom-draw wrapped text so it can wrap within long tokens
+        # (Excel-like). Qt's default WrapText feature wraps at word boundaries.
+        custom_wrapped_text = None
+        if wrap_flag:
+            try:
+                custom_wrapped_text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+            except Exception:
+                custom_wrapped_text = None
+
         try:
             wrap_feature = QStyleOptionViewItem.ViewItemFeature.WrapText
             if wrap_flag:
@@ -3268,6 +3525,13 @@ class _ExcelEditDelegate(QStyledItemDelegate):
                 opt.features &= ~wrap_feature
         except Exception:
             pass
+
+        # Prevent base delegate from drawing text when we custom paint it.
+        if custom_wrapped_text is not None:
+            try:
+                opt.text = ""
+            except Exception:
+                pass
 
         # Excel-like selection: no filled selection background, only an outline.
         outline_only = False
@@ -3301,6 +3565,38 @@ class _ExcelEditDelegate(QStyledItemDelegate):
             self.border_delegate.paint(painter, opt, index)
         else:
             super().paint(painter, opt, index)
+
+        # Custom wrapped text paint (wrap anywhere).
+        if custom_wrapped_text is not None and custom_wrapped_text:
+            try:
+                painter.save()
+                rect = opt.rect.adjusted(4, 2, -4, -2)
+                flags = Qt.TextFlag.TextWordWrap
+                try:
+                    flags |= Qt.TextFlag.TextWrapAnywhere
+                except Exception:
+                    pass
+
+                # Respect alignment when possible.
+                try:
+                    align = Qt.Alignment(int(getattr(opt, "displayAlignment", Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)))
+                except Exception:
+                    align = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+
+                # Use the same pen color Qt would use.
+                try:
+                    painter.setPen(opt.palette.color(QPalette.ColorRole.Text))
+                except Exception:
+                    pass
+
+                painter.drawText(rect, int(align | flags), str(custom_wrapped_text))
+            except Exception:
+                pass
+            finally:
+                try:
+                    painter.restore()
+                except Exception:
+                    pass
 
         # Draw an Excel-like outline for selected cells.
         if outline_only and is_selected:

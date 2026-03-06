@@ -1281,10 +1281,6 @@ class PdfViewer(QWidget):
     # Emitted after a successful save; payload is the output PDF path.
     drawing_saved = Signal(str)
 
-    # Emitted when interactive grid bounds are dragged/resized.
-    # Payload: (left_pct, top_pct, width_pct, height_pct)
-    grid_bounds_changed = Signal(float, float, float, float)
-
     # Emitted when user requests inserting selected extracted notes into Form 3 column G.
     insert_notes_to_form3_requested = Signal(str, object)
     
@@ -1386,10 +1382,6 @@ class PdfViewer(QWidget):
 
         # Drawing grid overlay (not saved into PDF)
         self.grid_items: list[QGraphicsItem] = []
-        self._grid_v_lines: list[QGraphicsLineItem] = []
-        self._grid_h_lines: list[QGraphicsLineItem] = []
-        self._grid_label_items: list[QGraphicsTextItem] = []
-        self._grid_bounds_item: _GridBoundsItem | None = None
         try:
             self.grid_enabled = bool(self._settings.value("pdf_viewer/grid_enabled", False, bool))
         except Exception:
@@ -1947,15 +1939,6 @@ class PdfViewer(QWidget):
         self.add_bubble_btn.setCheckable(True)
         self.add_bubble_btn.clicked.connect(self.toggle_placing_mode)
 
-        # Visual: show active state (checked) as light blue.
-        try:
-            self.add_bubble_btn.setStyleSheet(
-                "QPushButton:checked { background-color: #ADD8E6; color: #000; }"
-                "QPushButton:pressed { background-color: #ADD8E6; }"
-            )
-        except Exception:
-            pass
-
         self.bubble_number_spin = QSpinBox()
         self.bubble_number_spin.setRange(1, 9999)
         self.bubble_number_spin.setValue(int(getattr(self, "next_bubble_number", 1) or 1))
@@ -1969,15 +1952,6 @@ class PdfViewer(QWidget):
         self.add_range_btn = QPushButton("Add Range")
         self.add_range_btn.setCheckable(True)
         self.add_range_btn.toggled.connect(self.toggle_range_mode)
-
-        # Visual: show active state (checked) as light blue.
-        try:
-            self.add_range_btn.setStyleSheet(
-                "QPushButton:checked { background-color: #ADD8E6; color: #000; }"
-                "QPushButton:pressed { background-color: #ADD8E6; }"
-            )
-        except Exception:
-            pass
 
         self.clear_btn = QPushButton("Clear All")
         self.clear_btn.clicked.connect(self.clear_bubbles)
@@ -4510,35 +4484,26 @@ class PdfViewer(QWidget):
                         start, end, x, y, r = spec[:5]
                         bf = spec[5] if len(spec) > 5 else ""
                     except Exception:
-                        # Keep any malformed spec as-is (best effort).
-                        try:
-                            new_specs.append(tuple(spec))
-                        except Exception:
-                            pass
                         continue
-
+                    try:
+                        start, end, x, y, r = spec[:5]
+                        bf = spec[5] if len(spec) > 5 else ""
+                    except Exception:
+                        new_specs.append((start, end, x, y, r, str(bf or "")))
                     try:
                         s = int(start)
                         e = int(end)
-                        rx = float(x)
-                        ry = float(y)
-                        rr = int(r)
-                        bf2 = str(bf or "")
                     except Exception:
-                        # Keep original if it cannot be normalized.
-                        try:
-                            new_specs.append(tuple(spec))
-                        except Exception:
-                            pass
-                        continue
-
+                        new_specs.append((start, end, x, y, r, str(bf or "")))
+                    new_specs.append((int(s), int(e), float(x), float(y), int(r), str(bf or "")))
                     s2 = int(norm.get(s, s))
                     e2 = int(norm.get(e, e))
-                    if e2 < s2:
-                        e2 = s2
                     if s2 != s or e2 != e:
                         page_changed = True
-                    new_specs.append((int(s2), int(e2), float(rx), float(ry), int(rr), bf2))
+                    # Keep order for ranges.
+                    if e2 < s2:
+                        e2 = s2
+                    new_specs.append((int(s2), int(e2), float(x), float(y), int(r), str(bf or "")))
                 if page_changed:
                     changed = True
                     new_specs.sort(key=lambda t: (t[0], t[1], t[2], t[3]))
@@ -4897,158 +4862,6 @@ class PdfViewer(QWidget):
             pass
         self._rebuild_grid_overlay()
 
-        try:
-            self.grid_bounds_changed.emit(
-                float(self.grid_left_pct),
-                float(self.grid_top_pct),
-                float(self.grid_width_pct),
-                float(self.grid_height_pct),
-            )
-        except Exception:
-            pass
-
-    def _grid_page_rect(self) -> QRectF | None:
-        try:
-            if self.pixmap_item is None:
-                return None
-            r = self.pixmap_item.boundingRect()
-            return r if r.width() > 0 and r.height() > 0 else None
-        except Exception:
-            return None
-
-    def _grid_rect_from_pcts(self) -> QRectF | None:
-        page_rect = self._grid_page_rect()
-        if page_rect is None:
-            return None
-        try:
-            x0 = max(0.0, min(1.0, float(self.grid_left_pct) / 100.0))
-            y0 = max(0.0, min(1.0, float(self.grid_top_pct) / 100.0))
-            w = max(0.0, min(1.0, float(self.grid_width_pct) / 100.0))
-            h = max(0.0, min(1.0, float(self.grid_height_pct) / 100.0))
-        except Exception:
-            x0, y0, w, h = 0.0, 0.0, 1.0, 1.0
-        x1 = min(1.0, max(0.0, x0 + w))
-        y1 = min(1.0, max(0.0, y0 + h))
-        if x1 <= x0:
-            x0, x1 = 0.0, 1.0
-        if y1 <= y0:
-            y0, y1 = 0.0, 1.0
-
-        left = page_rect.left() + x0 * page_rect.width()
-        top = page_rect.top() + y0 * page_rect.height()
-        ww = (x1 - x0) * page_rect.width()
-        hh = (y1 - y0) * page_rect.height()
-        return QRectF(left, top, ww, hh)
-
-    def _grid_pcts_from_rect(self, rect: QRectF) -> tuple[float, float, float, float]:
-        page_rect = self._grid_page_rect()
-        if page_rect is None:
-            return (0.0, 0.0, 100.0, 100.0)
-
-        try:
-            x0 = (float(rect.left()) - float(page_rect.left())) / max(1e-9, float(page_rect.width()))
-            y0 = (float(rect.top()) - float(page_rect.top())) / max(1e-9, float(page_rect.height()))
-            x1 = (float(rect.right()) - float(page_rect.left())) / max(1e-9, float(page_rect.width()))
-            y1 = (float(rect.bottom()) - float(page_rect.top())) / max(1e-9, float(page_rect.height()))
-        except Exception:
-            return (0.0, 0.0, 100.0, 100.0)
-
-        x0 = max(0.0, min(1.0, x0))
-        y0 = max(0.0, min(1.0, y0))
-        x1 = max(0.0, min(1.0, x1))
-        y1 = max(0.0, min(1.0, y1))
-        if x1 < x0:
-            x0, x1 = x1, x0
-        if y1 < y0:
-            y0, y1 = y1, y0
-
-        left_pct = 100.0 * x0
-        top_pct = 100.0 * y0
-        width_pct = 100.0 * (x1 - x0)
-        height_pct = 100.0 * (y1 - y0)
-        return (left_pct, top_pct, width_pct, height_pct)
-
-    def _update_grid_overlay_from_rect(self, rect: QRectF) -> None:
-        """Update existing grid line/label items to match rect (no rebuild)."""
-        try:
-            cols = 8
-            rows = 4
-            cell_w = float(rect.width()) / float(cols)
-            cell_h = float(rect.height()) / float(rows)
-        except Exception:
-            return
-
-        # Lines
-        try:
-            for i, line in enumerate(list(self._grid_v_lines or [])):
-                x = float(rect.left()) + float(i) * cell_w
-                try:
-                    line.setLine(x, float(rect.top()), x, float(rect.top()) + float(rect.height()))
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        try:
-            for j, line in enumerate(list(self._grid_h_lines or [])):
-                y = float(rect.top()) + float(j) * cell_h
-                try:
-                    line.setLine(float(rect.left()), y, float(rect.left()) + float(rect.width()), y)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # Labels
-        try:
-            idx = 0
-            for r in range(rows):
-                for c in range(cols):
-                    if idx >= len(self._grid_label_items):
-                        break
-                    tx = float(rect.left()) + (float(c) + 0.5) * cell_w
-                    ty = float(rect.top()) + (float(r) + 0.5) * cell_h
-                    it = self._grid_label_items[idx]
-                    br = it.boundingRect()
-                    it.setPos(tx - br.width() / 2.0, ty - br.height() / 2.0)
-                    idx += 1
-        except Exception:
-            pass
-
-    def _on_grid_bounds_rect_dragging(self, rect: QRectF) -> None:
-        """Called by the interactive bounds item during drag."""
-        try:
-            self._update_grid_overlay_from_rect(rect)
-        except Exception:
-            pass
-
-        try:
-            l, t, w, h = self._grid_pcts_from_rect(rect)
-            self.grid_left_pct = float(l)
-            self.grid_top_pct = float(t)
-            self.grid_width_pct = float(w)
-            self.grid_height_pct = float(h)
-        except Exception:
-            return
-
-        try:
-            self.grid_bounds_changed.emit(
-                float(self.grid_left_pct),
-                float(self.grid_top_pct),
-                float(self.grid_width_pct),
-                float(self.grid_height_pct),
-            )
-        except Exception:
-            pass
-
-    def _on_grid_bounds_rect_committed(self, rect: QRectF) -> None:
-        """Called by the interactive bounds item on mouse release."""
-        try:
-            l, t, w, h = self._grid_pcts_from_rect(rect)
-            self.set_grid_bounds_pct(float(l), float(t), float(w), float(h))
-        except Exception:
-            pass
-
     def _clear_grid_overlay(self) -> None:
         try:
             for it in list(self.grid_items or []):
@@ -5059,10 +4872,6 @@ class PdfViewer(QWidget):
         except Exception:
             pass
         self.grid_items = []
-        self._grid_v_lines = []
-        self._grid_h_lines = []
-        self._grid_label_items = []
-        self._grid_bounds_item = None
 
     def _rebuild_grid_overlay(self) -> None:
         self._clear_grid_overlay()
@@ -5120,7 +4929,6 @@ class PdfViewer(QWidget):
                 line.setZValue(50)
                 self.scene.addItem(line)
                 self.grid_items.append(line)
-                self._grid_v_lines.append(line)
             except Exception:
                 pass
 
@@ -5133,7 +4941,6 @@ class PdfViewer(QWidget):
                 line.setZValue(50)
                 self.scene.addItem(line)
                 self.grid_items.append(line)
-                self._grid_h_lines.append(line)
             except Exception:
                 pass
 
@@ -5174,19 +4981,8 @@ class PdfViewer(QWidget):
                     text_item.setZValue(51)
                     self.scene.addItem(text_item)
                     self.grid_items.append(text_item)
-                    self._grid_label_items.append(text_item)
                 except Exception:
                     pass
-
-        # Interactive bounds rectangle
-        try:
-            bounds_rect = QRectF(float(grid_left), float(grid_top), float(grid_w), float(grid_h))
-            b = _GridBoundsItem(bounds_rect, viewer=self)
-            self.scene.addItem(b)
-            self.grid_items.append(b)
-            self._grid_bounds_item = b
-        except Exception:
-            pass
 
     def get_bubble_zones(self) -> dict[int, str]:
         """
@@ -5227,121 +5023,42 @@ class PdfViewer(QWidget):
         if y1 <= y0:
             y0, y1 = 0.0, 1.0
 
-        # Estimate bubble footprint in normalized coords so bubbles that sit on
-        # grid lines contribute to *all* touched zones.
-        page_rect = None
-        try:
-            page_rect = self.pixmap_item.boundingRect() if self.pixmap_item is not None else None
-        except Exception:
-            page_rect = None
-        try:
-            pw = float(page_rect.width()) if page_rect is not None else 0.0
-            ph = float(page_rect.height()) if page_rect is not None else 0.0
-        except Exception:
-            pw = ph = 0.0
-        if pw <= 0 or ph <= 0:
-            pw, ph = 1000.0, 1000.0
-
-        def _zone_str_for_touched(page_idx: int, touched: set[tuple[int, int]]) -> str:
-            # touched: {(row_idx, col_idx)}
-            by_col: dict[int, set[str]] = {}
-            for (ri, ci) in touched:
-                try:
-                    col_num = 8 - int(ci)
-                    letter = str(row_labels[int(ri)])
-                except Exception:
-                    continue
-                by_col.setdefault(int(col_num), set()).add(letter)
-
-            parts: list[str] = []
-            for col_num in sorted(by_col.keys()):
-                letters = sorted(by_col[col_num])
-                if not letters:
-                    continue
-                if len(letters) == 1:
-                    parts.append(f"{letters[0]}{col_num}")
-                else:
-                    parts.append(f"{letters[0]}{col_num}-{letters[-1]}{col_num}")
-
-            if not parts:
-                return ""
-            z = " ".join(parts)
-            if use_sheet_prefix:
-                return f"SH{int(page_idx) + 1} {z}"
-            return z
-
         for page_idx, specs in specs_by_page.items():
             for spec in specs:
                 try:
                     start, end, rx, ry, br = spec[:5]
                 except Exception:
                     continue
-
-                # Footprint in normalized coords.
+                # Calculate Zone using grid bounds
                 try:
-                    rpx = max(0.0, float(int(br)))
-                except Exception:
-                    rpx = 0.0
-                rx = float(rx)
-                ry = float(ry)
-                rnx = float(rpx) / max(1.0, pw)
-                rny = float(rpx) / max(1.0, ph)
+                    rxn = (float(rx) - x0) / max(1e-9, (x1 - x0))
+                    ryn = (float(ry) - y0) / max(1e-9, (y1 - y0))
+                    rxn = max(0.0, min(0.999999, rxn))
+                    ryn = max(0.0, min(0.999999, ryn))
 
-                bx0 = rx - rnx
-                bx1 = rx + rnx
-                by0 = ry - rny
-                by1 = ry + rny
+                    col_idx = int(rxn * 8.0)
+                    col_idx = max(0, min(7, col_idx))
+                    zone_num = 8 - col_idx
 
-                # Convert to grid-relative normalized 0..1
-                try:
-                    gx0 = (bx0 - x0) / max(1e-9, (x1 - x0))
-                    gx1 = (bx1 - x0) / max(1e-9, (x1 - x0))
-                    gy0 = (by0 - y0) / max(1e-9, (y1 - y0))
-                    gy1 = (by1 - y0) / max(1e-9, (y1 - y0))
-                except Exception:
-                    continue
+                    row_idx = int(ryn * 4.0)
+                    row_idx = max(0, min(3, row_idx))
+                    zone_letter = row_labels[row_idx]
 
-                gx0, gx1 = sorted((gx0, gx1))
-                gy0, gy1 = sorted((gy0, gy1))
+                    zone_str = f"{zone_letter}{zone_num}"
+                    if use_sheet_prefix:
+                        zone_str = f"SH{page_idx + 1} {zone_str}"
 
-                gx0 = max(0.0, min(0.999999, gx0))
-                gx1 = max(0.0, min(0.999999, gx1))
-                gy0 = max(0.0, min(0.999999, gy0))
-                gy1 = max(0.0, min(0.999999, gy1))
-
-                try:
-                    c0 = int(gx0 * 8.0)
-                    c1 = int(gx1 * 8.0)
-                    r0 = int(gy0 * 4.0)
-                    r1 = int(gy1 * 4.0)
-                except Exception:
-                    continue
-
-                c0 = max(0, min(7, int(c0)))
-                c1 = max(0, min(7, int(c1)))
-                r0 = max(0, min(3, int(r0)))
-                r1 = max(0, min(3, int(r1)))
-
-                touched: set[tuple[int, int]] = set()
-                for ri in range(min(r0, r1), max(r0, r1) + 1):
-                    for ci in range(min(c0, c1), max(c0, c1) + 1):
-                        touched.add((int(ri), int(ci)))
-
-                zone_str = _zone_str_for_touched(int(page_idx), touched)
-                if not zone_str:
-                    continue
-
-                try:
+                    # Expand ranges
                     s = int(start)
                     e = int(end)
                     if e < s:
                         e = s
                     if e - s > 9999:
                         e = s
+                    for n in range(s, e + 1):
+                        zones[n] = zone_str
                 except Exception:
-                    continue
-                for n in range(int(s), int(e) + 1):
-                    zones[int(n)] = zone_str
+                    pass
                     
         return zones
 

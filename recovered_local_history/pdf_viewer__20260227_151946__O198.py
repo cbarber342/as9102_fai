@@ -1947,15 +1947,6 @@ class PdfViewer(QWidget):
         self.add_bubble_btn.setCheckable(True)
         self.add_bubble_btn.clicked.connect(self.toggle_placing_mode)
 
-        # Visual: show active state (checked) as light blue.
-        try:
-            self.add_bubble_btn.setStyleSheet(
-                "QPushButton:checked { background-color: #ADD8E6; color: #000; }"
-                "QPushButton:pressed { background-color: #ADD8E6; }"
-            )
-        except Exception:
-            pass
-
         self.bubble_number_spin = QSpinBox()
         self.bubble_number_spin.setRange(1, 9999)
         self.bubble_number_spin.setValue(int(getattr(self, "next_bubble_number", 1) or 1))
@@ -1969,15 +1960,6 @@ class PdfViewer(QWidget):
         self.add_range_btn = QPushButton("Add Range")
         self.add_range_btn.setCheckable(True)
         self.add_range_btn.toggled.connect(self.toggle_range_mode)
-
-        # Visual: show active state (checked) as light blue.
-        try:
-            self.add_range_btn.setStyleSheet(
-                "QPushButton:checked { background-color: #ADD8E6; color: #000; }"
-                "QPushButton:pressed { background-color: #ADD8E6; }"
-            )
-        except Exception:
-            pass
 
         self.clear_btn = QPushButton("Clear All")
         self.clear_btn.clicked.connect(self.clear_bubbles)
@@ -4510,35 +4492,26 @@ class PdfViewer(QWidget):
                         start, end, x, y, r = spec[:5]
                         bf = spec[5] if len(spec) > 5 else ""
                     except Exception:
-                        # Keep any malformed spec as-is (best effort).
-                        try:
-                            new_specs.append(tuple(spec))
-                        except Exception:
-                            pass
                         continue
-
+                    try:
+                        start, end, x, y, r = spec[:5]
+                        bf = spec[5] if len(spec) > 5 else ""
+                    except Exception:
+                        new_specs.append((start, end, x, y, r, str(bf or "")))
                     try:
                         s = int(start)
                         e = int(end)
-                        rx = float(x)
-                        ry = float(y)
-                        rr = int(r)
-                        bf2 = str(bf or "")
                     except Exception:
-                        # Keep original if it cannot be normalized.
-                        try:
-                            new_specs.append(tuple(spec))
-                        except Exception:
-                            pass
-                        continue
-
+                        new_specs.append((start, end, x, y, r, str(bf or "")))
+                    new_specs.append((int(s), int(e), float(x), float(y), int(r), str(bf or "")))
                     s2 = int(norm.get(s, s))
                     e2 = int(norm.get(e, e))
-                    if e2 < s2:
-                        e2 = s2
                     if s2 != s or e2 != e:
                         page_changed = True
-                    new_specs.append((int(s2), int(e2), float(rx), float(ry), int(rr), bf2))
+                    # Keep order for ranges.
+                    if e2 < s2:
+                        e2 = s2
+                    new_specs.append((int(s2), int(e2), float(x), float(y), int(r), str(bf or "")))
                 if page_changed:
                     changed = True
                     new_specs.sort(key=lambda t: (t[0], t[1], t[2], t[3]))

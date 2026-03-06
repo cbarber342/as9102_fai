@@ -232,44 +232,9 @@ class DrawingViewerWindow(QMainWindow):
         # Bubble backfill swatches (apply to selected bubbles)
         try:
             tb.addWidget(QLabel("Backfill:"))
-            # Defaults: left=orange, middle=yellow, right=no color.
-            # If a user previously customized swatches, respect their saved values.
-            # If swatches were never customized (old default all-white), migrate.
-            k1 = "pdf_viewer/bubble_backfill_swatch1_rgb"
-            k2 = "pdf_viewer/bubble_backfill_swatch2_rgb"
-            k3 = "pdf_viewer/bubble_backfill_swatch3_rgb"
-
-            raw1 = self._settings.value(k1, None)
-            raw2 = self._settings.value(k2, None)
-            raw3 = self._settings.value(k3, None)
-
-            def _norm(x) -> str:
-                return str(x or "").strip().lstrip("#").upper()
-
-            n1, n2, n3 = _norm(raw1), _norm(raw2), _norm(raw3)
-            all_present = False
-            try:
-                all_present = bool(self._settings.contains(k1) and self._settings.contains(k2) and self._settings.contains(k3))
-            except Exception:
-                all_present = False
-
-            # Migrate only if settings exist and match the old defaults (all white).
-            if all_present and (n1, n2, n3) == ("FFFFFF", "FFFFFF", "FFFFFF"):
-                try:
-                    self._settings.setValue(k1, "FFA500")  # orange
-                    self._settings.setValue(k2, "FFFF00")  # yellow
-                    self._settings.setValue(k3, "")
-                except Exception:
-                    pass
-                n1, n2, n3 = "FFA500", "FFFF00", ""
-
-            # If any swatch is missing/unset, use the new defaults for that swatch.
-            if not n1:
-                n1 = "FFA500"
-            if not n2:
-                n2 = "FFFF00"
-            # For swatch 3, default is "no color".
-            bf1, bf2, bf3 = n1, n2, n3
+            bf1 = str(self._settings.value("pdf_viewer/bubble_backfill_swatch1_rgb", "FFFFFF", type=str) or "").strip()
+            bf2 = str(self._settings.value("pdf_viewer/bubble_backfill_swatch2_rgb", "FFFFFF", type=str) or "").strip()
+            bf3 = str(self._settings.value("pdf_viewer/bubble_backfill_swatch3_rgb", "FFFFFF", type=str) or "").strip()
 
             bf_btn1 = _ColorSwatchCheckBox("", bf1 or None, tb)
             bf_btn2 = _ColorSwatchCheckBox("", bf2 or None, tb)
@@ -277,7 +242,7 @@ class DrawingViewerWindow(QMainWindow):
 
             bf_btn1.setToolTip("Backfill color 1 (right-click to change)")
             bf_btn2.setToolTip("Backfill color 2 (right-click to change)")
-            bf_btn3.setToolTip("Backfill color 3 (default none; right-click to change)")
+            bf_btn3.setToolTip("Backfill color 3 (default white; right-click to change)")
 
             bf_group = QButtonGroup(tb)
             bf_group.setExclusive(True)
@@ -419,13 +384,7 @@ class DrawingViewerWindow(QMainWindow):
                     specs_by_page = {}
 
                 for _page_idx, specs in (specs_by_page or {}).items():
-                    for spec in (specs or []):
-                        # bubble_specs may include additional fields (color, rect, etc.).
-                        try:
-                            start = spec[0]
-                            end = spec[1]
-                        except Exception:
-                            continue
+                    for start, end, _x, _y, _r in (specs or []):
                         try:
                             s = int(start)
                             e = int(end)
@@ -571,26 +530,12 @@ class DrawingViewerWindow(QMainWindow):
                 self._pop_btn = QPushButton("Pop Out")
                 self._pop_btn.setToolTip("Undock this viewer into a separate window")
                 self._pop_btn.clicked.connect(self._pop_out_callback)
-                # Match sizing with other toolbar controls.
-                try:
-                    ref_h = int(v.add_bubble_btn.sizeHint().height()) if hasattr(v, "add_bubble_btn") else 0
-                    if ref_h > 0:
-                        self._pop_btn.setFixedHeight(ref_h)
-                except Exception:
-                    pass
                 tb.addWidget(self._pop_btn)
 
             if self._dock_back_callback is not None:
                 self._dock_btn = QPushButton("Dock Back")
                 self._dock_btn.setToolTip("Dock this viewer back into the main tabs")
                 self._dock_btn.clicked.connect(self._dock_back_callback)
-                # Match sizing with other toolbar controls.
-                try:
-                    ref_h = int(v.add_bubble_btn.sizeHint().height()) if hasattr(v, "add_bubble_btn") else 0
-                    if ref_h > 0:
-                        self._dock_btn.setFixedHeight(ref_h)
-                except Exception:
-                    pass
                 tb.addWidget(self._dock_btn)
 
             # Default: assume "docked" when created with a pop-out callback.
@@ -974,7 +919,7 @@ class DrawingViewerWindow(QMainWindow):
         props_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self.addDockWidget(Qt.RightDockWidgetArea, props_dock)
 
-        # Notes dock
+        # Notes dock (tabbed with Actions)
         notes_page = QWidget()
         notes_l = QVBoxLayout(notes_page)
         notes_l.setContentsMargins(6, 6, 6, 6)
@@ -996,7 +941,6 @@ class DrawingViewerWindow(QMainWindow):
         notes_l.addWidget(v.extract_notes_btn)
         notes_l.addStretch(1)
 
-        # Actions dock
         actions_page = QWidget()
         actions_l = QVBoxLayout(actions_page)
         actions_l.setContentsMargins(6, 6, 6, 6)
@@ -1011,18 +955,16 @@ class DrawingViewerWindow(QMainWindow):
             pass
         actions_l.addStretch(1)
 
+        tabs = QTabWidget()
+        tabs.addTab(notes_page, "Notes")
+        tabs.addTab(actions_page, "Actions")
+
         notes_dock = QDockWidget("Notes", self)
-        notes_dock.setWidget(notes_page)
+        notes_dock.setWidget(tabs)
         notes_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self.addDockWidget(Qt.RightDockWidgetArea, notes_dock)
 
-        actions_dock = QDockWidget("Actions", self)
-        actions_dock.setWidget(actions_page)
-        actions_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
-        self.addDockWidget(Qt.RightDockWidgetArea, actions_dock)
-
         self.tabifyDockWidget(props_dock, notes_dock)
-        self.tabifyDockWidget(props_dock, actions_dock)
         notes_dock.raise_()
 
         # Enhance dock removed (Enhance moved into Properties).
