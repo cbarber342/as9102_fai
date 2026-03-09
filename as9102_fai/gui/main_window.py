@@ -673,6 +673,16 @@ class MainWindow(QMainWindow):
         if not ws3_name or not viewer3 or ws3_name not in self._template_wb.sheetnames:
             return
 
+        # In "Open Existing FAI" mode, never regenerate or mutate Form 3 here.
+        # The Auto Add toggle applies derived rows explicitly on toggle.
+        try:
+            if self._is_open_existing_fai_mode():
+                viewer3.set_overrides({})
+                viewer3.render()
+                return
+        except Exception:
+            pass
+
         try:
             self._write_form3_to_worksheet(self._template_wb[ws3_name])
         except Exception:
@@ -682,6 +692,537 @@ class MainWindow(QMainWindow):
             viewer3.render()
         except Exception:
             pass
+
+    def _form3_detect_table_layout(self, ws) -> dict[str, int | None]:
+        """Best-effort detection of Form 3 table layout.
+
+        Returns keys:
+          - start_row (int)
+          - header_row (int)
+          - results_col (int)
+        """
+
+        start_row = 6
+        header_row = 5
+        for r in range(1, 20):
+            try:
+                val = ws.cell(row=r, column=2).value
+            except Exception:
+                val = None
+            if val and "char no." in str(val).lower():
+                header_row = r
+                start_row = r + 1
+                # If the next row still looks like header content, skip it.
+                try:
+                    row_text = " ".join(
+                        [
+                            str(ws.cell(row=start_row, column=c).value or "")
+                            for c in range(1, min(int(getattr(ws, "max_column", 0) or 0), 30) + 1)
+                        ]
+                    ).lower()
+                    if "op #" in row_text or "op#" in row_text or "reference location" in row_text or "bubble" in row_text:
+                        start_row = r + 2
+                except Exception:
+                    pass
+                break
+
+        def _norm_header(v: object) -> str:
+            if v is None:
+                return ""
+            s = str(v).strip().lower()
+            s = re.sub(r"[\s\t\r\n]+", " ", s)
+            return s
+
+        results_col: int | None = None
+        bonus_tol_col: int | None = None
+
+        header_row = max(1, int(header_row or max(1, start_row - 1)))
+        header_rows_to_scan = [header_row]
+        try:
+            if header_row + 1 <= int(getattr(ws, "max_row", 0) or 0):
+                header_rows_to_scan.append(header_row + 1)
+        except Exception:
+            pass
+
+        try:
+            max_col = int(getattr(ws, "max_column", 0) or 0)
+        except Exception:
+            max_col = 0
+
+        try:
+            for hr in header_rows_to_scan:
+                for cc in range(1, max_col + 1):
+                    hv = ws.cell(row=hr, column=cc).value
+                    if hv is None or str(hv).strip() == "":
+                        continue
+                    h = _norm_header(hv)
+                    if bonus_tol_col is None and ("bonus" in h and "tolerance" in h):
+                        bonus_tol_col = cc
+                    if results_col is None and ("result" in h or "results" in h or "actual" in h):
+                        if not ("bonus" in h and "tolerance" in h):
+                            results_col = cc
+
+            # Fallbacks for common templates.
+            if results_col is None and max_col >= 11:
+                results_col = 11
+
+            if results_col is None:
+                results_col = 12
+
+            # Avoid mis-detecting Bonus Tolerance as Results.
+            if results_col is not None and bonus_tol_col is not None and int(results_col) == int(bonus_tol_col):
+                # Prefer the common Results column.
+                if max_col >= 11:
+                    results_col = 11
+        except Exception:
+            if results_col is None:
+                results_col = 12
+
+        return {
+            "start_row": int(start_row),
+            "header_row": int(header_row),
+            "results_col": int(results_col) if results_col is not None else None,
+        }
+
+    def _form3_find_table_end_row(self, ws, *, start_row: int) -> int:
+        # Walk downward until we hit a stretch of empty rows in key columns.
+        try:
+            ws_max_row = int(getattr(ws, "max_row", 0) or 0)
+        except Exception:
+            ws_max_row = 0
+        max_scan = min(max(ws_max_row, start_row + 250), start_row + 2000)
+        started = False
+        empty_run = 0
+        last_seen = start_row
+        for rr in range(start_row, max_scan + 1):
+            try:
+                c2 = ws.cell(row=rr, column=2).value
+                c7 = ws.cell(row=rr, column=7).value
+            except Exception:
+                c2 = None
+                c7 = None
+            has_any = (c2 is not None and str(c2).strip() != "") or (c7 is not None and str(c7).strip() != "")
+            if has_any:
+                started = True
+                empty_run = 0
+                last_seen = rr
+            else:
+                if started:
+                    empty_run += 1
+                    if empty_run >= 25:
+                        break
+        return max(start_row, last_seen)
+
+    def _apply_thread_extras_to_existing_form3_worksheet(self, ws, *, enabled: bool) -> None:
+        """Add/remove derived thread rows on an existing workbook's Form 3.
+
+        This is used in "Open Existing FAI" mode so we never regenerate Form 3
+        from CHR/Calypso input, but the Auto Add checkbox still works.
+        """
+
+        enabled = bool(enabled)
+        layout = self._form3_detect_table_layout(ws)
+        start_row = int(layout.get("start_row") or 6)
+        header_row = int(layout.get("header_row") or max(1, start_row - 1))
+        results_col = int(layout.get("results_col") or 12)
+
+        # Detect optional columns (template-dependent).
+        unit_col: int | None = None
+        tooling_col: int | None = None
+        additional_col: int | None = None
+
+        def _norm_header(v: object) -> str:
+            if v is None:
+                return ""
+            s = str(v).strip().lower()
+            s = re.sub(r"[\s\t\r\n]+", " ", s)
+            return s
+
+        try:
+            max_col = min(int(getattr(ws, "max_column", 0) or 0), 26)
+        except Exception:
+            max_col = 26
+
+        header_rows_to_scan = [max(1, header_row)]
+        try:
+            if header_row + 1 <= int(getattr(ws, "max_row", 0) or 0):
+                header_rows_to_scan.append(header_row + 1)
+        except Exception:
+            pass
+
+        try:
+            for hr in header_rows_to_scan:
+                for cc in range(1, max_col + 1):
+                    hv = ws.cell(row=hr, column=cc).value
+                    if hv is None or str(hv).strip() == "":
+                        continue
+                    h = _norm_header(hv)
+                    if unit_col is None and ("unit" in h) and ("measure" in h or "measurement" in h or "uom" in h):
+                        unit_col = cc
+                    if tooling_col is None and ("tooling" in h) and ("designed" in h) and ("qualified" in h):
+                        tooling_col = cc
+                    if additional_col is None and ("comment" in h) and ("additional" in h or "addtion" in h) and ("data" in h):
+                        additional_col = cc
+                if unit_col is not None and tooling_col is not None and additional_col is not None:
+                    break
+
+            # Common template fallbacks.
+            if unit_col is None and max_col >= 10:
+                hv = ws.cell(row=header_rows_to_scan[0], column=10).value
+                if hv and "unit" in str(hv).lower():
+                    unit_col = 10
+            if tooling_col is None and max_col >= 12:
+                tooling_col = 12
+            if additional_col is None and max_col >= 17:
+                additional_col = 17
+        except Exception:
+            pass
+
+        end_row = self._form3_find_table_end_row(ws, start_row=start_row)
+
+        # Build base rows list and the set of derived IDs expected from earlier base rows.
+        expected_derived_ids: set[str] = set()
+        base_rows: list[dict[str, object]] = []
+        existing_descs: set[str] = set()
+
+        def _cell_str(rr: int, cc: int) -> str:
+            try:
+                v = ws.cell(row=rr, column=cc).value
+            except Exception:
+                v = None
+            return str(v or "").strip()
+
+        # First pass: gather existing description texts for quick membership checks.
+        for rr in range(start_row, end_row + 1):
+            d = _cell_str(rr, 7)
+            if d:
+                existing_descs.add(d)
+
+        # Second pass: identify base rows, skipping derived rows that match prior base expected IDs.
+        # Also snapshot base-row bubble numbers so we can compute a mapping for PDF bubbles
+        # only if we end up changing the worksheet.
+        base_key_to_bubble_before: dict[tuple[str, str, str], int] = {}
+        for rr in range(start_row, end_row + 1):
+            desc = _cell_str(rr, 7)
+            if not desc:
+                continue
+
+            # If this row matches a derived ID from an earlier base row, treat it as derived.
+            if desc in expected_derived_ids:
+                continue
+
+            spec = _cell_str(rr, 8)
+            ref = _cell_str(rr, 4)
+            bub = _cell_str(rr, 5) or _cell_str(rr, 2)
+            try:
+                bub_i = int(float(bub)) if str(bub).strip() != "" else 0
+            except Exception:
+                bub_i = 0
+
+            key = (desc, spec, ref)
+            if bub_i > 0:
+                base_key_to_bubble_before[key] = bub_i
+
+            # Create a minimal characteristic object for rule matching and derived generation.
+            try:
+                dummy = FaiCharacteristic(
+                    id=desc,
+                    feature_name=desc,
+                    description=spec,
+                    actual=_cell_str(rr, results_col),
+                    nominal="",
+                    upper_tol="",
+                    lower_tol="",
+                    type="",
+                    unit="",
+                    group1=ref,
+                    source="calypso",
+                    is_thread=False,
+                    is_attribute=False,
+                    comment="",
+                )
+            except Exception:
+                dummy = None
+
+            rule = None
+            if dummy is not None:
+                try:
+                    rule = self._thread_rule_for_char(dummy)
+                except Exception:
+                    rule = None
+
+            derived_objs: list[object] = []
+            if rule and dummy is not None:
+                try:
+                    derived_objs = list(self._derived_thread_rows_for_char(dummy, rule))
+                except Exception:
+                    derived_objs = []
+
+            derived_ids: list[str] = []
+            for dobj in derived_objs:
+                try:
+                    did = str(getattr(dobj, "id", "") or "").strip()
+                except Exception:
+                    did = ""
+                if did:
+                    derived_ids.append(did)
+
+            # Track expected derived IDs so later rows can be recognized as derived.
+            for did in derived_ids:
+                expected_derived_ids.add(did)
+
+            base_rows.append(
+                {
+                    "row": int(rr),
+                    "desc": desc,
+                    "spec": spec,
+                    "ref": ref,
+                    "derived_ids": derived_ids,
+                }
+            )
+
+        # Apply add/remove.
+        red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+        changed = False
+
+        if enabled:
+            # Insert missing derived rows after each base row (iterate bottom→top so indices stay valid).
+            for base in reversed(base_rows):
+                base_row = int(base.get("row") or 0)
+                base_ref = str(base.get("ref") or "").strip()
+                derived_ids = list(base.get("derived_ids") or [])
+                if not derived_ids:
+                    continue
+
+                insert_offset = 0
+                for did in derived_ids:
+                    did_s = str(did or "").strip()
+                    if not did_s:
+                        continue
+                    if did_s in existing_descs:
+                        continue
+
+                    insert_at = base_row + 1 + insert_offset
+                    try:
+                        ws.insert_rows(insert_at, 1)
+                    except Exception:
+                        continue
+
+                    changed = True
+
+                    # Copy borders/formatting so inserted rows don't lose table lines.
+                    try:
+                        self._copy_form3_row_style(ws, src_row=base_row, dst_row=insert_at, max_col=26)
+                    except Exception:
+                        pass
+
+                    # Write derived row values.
+                    try:
+                        if base_ref:
+                            ws.cell(row=insert_at, column=4).value = base_ref
+                    except Exception:
+                        pass
+                    try:
+                        ws.cell(row=insert_at, column=7).value = did_s
+                    except Exception:
+                        pass
+                    try:
+                        ws.cell(row=insert_at, column=8).value = ""
+                    except Exception:
+                        pass
+                    try:
+                        ws.cell(row=insert_at, column=results_col).value = ""
+                    except Exception:
+                        pass
+
+                    # Copy unit-of-measure from the base row when available.
+                    if unit_col is not None:
+                        try:
+                            ws.cell(row=insert_at, column=int(unit_col)).value = ws.cell(row=base_row, column=int(unit_col)).value
+                        except Exception:
+                            pass
+
+                    # Highlight derived row cells in red (matching Create New behavior).
+                    try:
+                        cols_to_mark: list[int] = [4, 5, 7, 8, int(results_col or 12)]
+                        if unit_col is not None:
+                            cols_to_mark.append(int(unit_col))
+                        if tooling_col is not None:
+                            cols_to_mark.append(int(tooling_col))
+                        if additional_col is not None:
+                            cols_to_mark.append(int(additional_col))
+                        for cc in sorted(set([c for c in cols_to_mark if c and c > 0])):
+                            ws.cell(row=insert_at, column=cc).fill = red_fill
+                    except Exception:
+                        pass
+
+                    existing_descs.add(did_s)
+                    insert_offset += 1
+
+        else:
+            # Delete derived rows we would generate from the current base rows.
+            derived_to_delete: set[str] = set()
+            for base in base_rows:
+                for did in (base.get("derived_ids") or []):
+                    s = str(did or "").strip()
+                    if s:
+                        derived_to_delete.add(s)
+
+            # Collect row indices to delete.
+            rows_to_delete: list[int] = []
+            for rr in range(start_row, self._form3_find_table_end_row(ws, start_row=start_row) + 1):
+                desc = _cell_str(rr, 7)
+                if desc and desc in derived_to_delete:
+                    rows_to_delete.append(int(rr))
+
+            for rr in sorted(set(rows_to_delete), reverse=True):
+                try:
+                    ws.delete_rows(rr, 1)
+                    changed = True
+                except Exception:
+                    pass
+
+        if not changed:
+            return
+
+        # Renumber Char No (col B) and Bubble Number (col E) for all populated rows.
+        end_row2 = self._form3_find_table_end_row(ws, start_row=start_row)
+        row_num = 0
+        for rr in range(start_row, end_row2 + 1):
+            desc = _cell_str(rr, 7)
+            if not desc:
+                continue
+            row_num += 1
+            try:
+                ws.cell(row=rr, column=2).value = row_num
+            except Exception:
+                pass
+            try:
+                ws.cell(row=rr, column=5).value = row_num
+            except Exception:
+                pass
+
+        # Compute and apply bubble renumber mapping for base rows.
+        base_key_to_bubble_after: dict[tuple[str, str, str], int] = {}
+        expected_derived_ids_after: set[str] = set()
+        end_row3 = self._form3_find_table_end_row(ws, start_row=start_row)
+        for rr in range(start_row, end_row3 + 1):
+            desc = _cell_str(rr, 7)
+            if not desc:
+                continue
+            if desc in expected_derived_ids_after:
+                continue
+            spec = _cell_str(rr, 8)
+            ref = _cell_str(rr, 4)
+            bub = _cell_str(rr, 5) or _cell_str(rr, 2)
+            try:
+                bub_i = int(float(bub)) if str(bub).strip() != "" else 0
+            except Exception:
+                bub_i = 0
+            if bub_i > 0:
+                base_key_to_bubble_after[(desc, spec, ref)] = bub_i
+
+            # Update derived-id expectations as we walk base rows.
+            try:
+                dummy = FaiCharacteristic(
+                    id=desc,
+                    feature_name=desc,
+                    description=spec,
+                    actual=_cell_str(rr, results_col),
+                    nominal="",
+                    upper_tol="",
+                    lower_tol="",
+                    type="",
+                    unit="",
+                    group1=ref,
+                    source="calypso",
+                    is_thread=False,
+                    is_attribute=False,
+                    comment="",
+                )
+                rule = self._thread_rule_for_char(dummy)
+                if rule:
+                    for dobj in self._derived_thread_rows_for_char(dummy, rule):
+                        did = str(getattr(dobj, "id", "") or "").strip()
+                        if did:
+                            expected_derived_ids_after.add(did)
+            except Exception:
+                pass
+
+        mapping: dict[int, int] = {}
+        for key, old_n in base_key_to_bubble_before.items():
+            new_n = base_key_to_bubble_after.get(key)
+            if new_n is None:
+                continue
+            try:
+                if int(old_n) != int(new_n):
+                    mapping[int(old_n)] = int(new_n)
+            except Exception:
+                continue
+
+        if mapping:
+            for viewer_attr in ("drawing_viewer_tab", "pdf_window"):
+                try:
+                    w = getattr(self, viewer_attr, None)
+                    pv = getattr(w, "_pdf_viewer", None) if w is not None else None
+                    if pv is not None and hasattr(pv, "apply_bubble_number_mapping"):
+                        pv.apply_bubble_number_mapping(dict(mapping))
+                except Exception:
+                    pass
+
+    def _copy_form3_row_style(self, ws, *, src_row: int, dst_row: int, max_col: int = 26) -> None:
+        """Best-effort copy of cell formatting (borders/fonts/etc.) from one row to another."""
+
+        if ws is None:
+            return
+        try:
+            srow = int(src_row)
+            drow = int(dst_row)
+            mcol = int(max_col)
+        except Exception:
+            return
+        if srow <= 0 or drow <= 0 or mcol <= 0:
+            return
+
+        # Copy row height if present.
+        try:
+            ws.row_dimensions[drow].height = ws.row_dimensions[srow].height
+        except Exception:
+            pass
+
+        for cc in range(1, mcol + 1):
+            try:
+                src = ws.cell(row=srow, column=cc)
+                dst = ws.cell(row=drow, column=cc)
+            except Exception:
+                continue
+
+            # Copy common style properties. Do not copy the value.
+            try:
+                dst.font = copy.copy(getattr(src, "font", None))
+            except Exception:
+                pass
+            try:
+                dst.border = copy.copy(getattr(src, "border", None))
+            except Exception:
+                pass
+            try:
+                dst.fill = copy.copy(getattr(src, "fill", None))
+            except Exception:
+                pass
+            try:
+                dst.number_format = getattr(src, "number_format", dst.number_format)
+            except Exception:
+                pass
+            try:
+                dst.protection = copy.copy(getattr(src, "protection", None))
+            except Exception:
+                pass
+            try:
+                dst.alignment = copy.copy(getattr(src, "alignment", None))
+            except Exception:
+                pass
 
     def _iter_form3_characteristics_for_write(self, *, include_thread_extras: bool) -> list[object]:
         """Return the ordered list of characteristic objects that Form 3 will write.
@@ -771,25 +1312,40 @@ class MainWindow(QMainWindow):
             old_enabled = False
 
         if enabled != old_enabled:
-            mapping = {}
+            # In Create New mode, compute the mapping from the parsed characteristics.
+            # In Open Existing mode, mapping is computed from the worksheet before/after
+            # applying derived rows.
             try:
-                mapping = self._form3_bubble_number_mapping(
-                    from_include_thread_extras=old_enabled,
-                    to_include_thread_extras=enabled,
-                )
-            except Exception:
-                mapping = {}
-
-            if mapping:
-                # Apply to both embedded + pop-out viewers (whichever exist).
-                for viewer_attr in ("drawing_viewer_tab", "pdf_window"):
+                if self._is_open_existing_fai_mode():
                     try:
-                        w = getattr(self, viewer_attr, None)
-                        pv = getattr(w, "_pdf_viewer", None) if w is not None else None
-                        if pv is not None and hasattr(pv, "apply_bubble_number_mapping"):
-                            pv.apply_bubble_number_mapping(dict(mapping))
+                        if self._template_wb is not None:
+                            ws3_name = self._form_sheet_names.get("3")
+                            if ws3_name and ws3_name in self._template_wb.sheetnames:
+                                ws3 = self._template_wb[ws3_name]
+                                self._apply_thread_extras_to_existing_form3_worksheet(ws3, enabled=enabled)
                     except Exception:
                         pass
+                else:
+                    mapping = {}
+                    try:
+                        mapping = self._form3_bubble_number_mapping(
+                            from_include_thread_extras=old_enabled,
+                            to_include_thread_extras=enabled,
+                        )
+                    except Exception:
+                        mapping = {}
+
+                    if mapping:
+                        for viewer_attr in ("drawing_viewer_tab", "pdf_window"):
+                            try:
+                                w = getattr(self, viewer_attr, None)
+                                pv = getattr(w, "_pdf_viewer", None) if w is not None else None
+                                if pv is not None and hasattr(pv, "apply_bubble_number_mapping"):
+                                    pv.apply_bubble_number_mapping(dict(mapping))
+                            except Exception:
+                                pass
+            except Exception:
+                pass
 
         # Persist the setting and refresh the sheet.
         try:
@@ -840,46 +1396,51 @@ class MainWindow(QMainWindow):
                 pass
 
     def load_defaults(self):
-        """Populate the UI with default file paths; auto-load when files exist."""
+        """Populate UI defaults.
+
+        Per request, on startup we clear all inputs and do not auto-load files
+        until the user selects a Mode.
+        """
         print("DEBUG: load_defaults started")
-        last_chr = str(self._settings.value("paths/chr", ""))
-        last_template = str(self._settings.value("paths/template", ""))
-        last_drawing = str(self._settings.value("paths/drawing_pdf", ""))
         last_machine = str(self._settings.value("inputs/calibrated_equipment_machine", ""))
 
-        chr_path = last_chr.strip() or self.default_chr_path
-        template_path = last_template.strip() or self.default_template_path
-        drawing_path = last_drawing.strip() or self.default_drawing_path
+        # Clear all file-path edits and internal paths.
+        try:
+            self.chr_path_edit.setText("")
+        except Exception:
+            pass
+        try:
+            self.template_path_edit.setText("")
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "existing_fai_path_edit") and self.existing_fai_path_edit is not None:
+                self.existing_fai_path_edit.setText("")
+        except Exception:
+            pass
+        try:
+            self.drawing_pdf_edit.setText("")
+        except Exception:
+            pass
 
-        if chr_path:
-            # Use the same code path as the Browse button when possible.
-            if os.path.exists(chr_path):
-                print(f"DEBUG: Loading CHR: {chr_path}")
-                self.load_chr(chr_path)
-            else:
-                self.chr_path_edit.setText(chr_path)
+        try:
+            self.template_path = ""
+        except Exception:
+            pass
+        try:
+            self.drawing_pdf_path = ""
+        except Exception:
+            pass
+        try:
+            self.characteristics = []
+        except Exception:
+            pass
 
-        if template_path:
-            self.template_path_edit.setText(template_path)
-            if os.path.exists(template_path):
-                self.template_path = template_path
-                print(f"DEBUG: Loading Template: {template_path}")
-                self.load_template()
-
-        if drawing_path:
-            self.drawing_pdf_edit.setText(drawing_path)
-            if os.path.exists(drawing_path):
-                self.drawing_pdf_path = drawing_path
-                try:
-                    dv = getattr(self, "drawing_viewer_tab", None)
-                    if dv is not None:
-                        print(f"DEBUG: Loading PDF: {drawing_path}")
-                        dv.load_pdf(self.drawing_pdf_path)
-                        # Bubble state may already exist on the drawing. Sync
-                        # Form 3 shading after the viewer finishes loading.
-                        QTimer.singleShot(75, self._sync_bubbles_to_form3)
-                except Exception:
-                    pass
+        # Clear workbook/viewers.
+        try:
+            self.load_template(persist_settings=False)
+        except Exception:
+            pass
 
         # Populate machine dropdown from persisted equipment rows and restore selection.
         try:
@@ -930,6 +1491,22 @@ class MainWindow(QMainWindow):
         inputs_layout.setContentsMargins(8, 8, 8, 8)
         inputs_layout.setSpacing(8)
 
+        mode_group = QGroupBox("FAI")
+        mode_layout = QFormLayout(mode_group)
+        mode_layout.setContentsMargins(8, 8, 8, 8)
+        mode_layout.setSpacing(6)
+
+        self.fai_mode_combo = QComboBox()
+        # Mode should start blank; nothing loads/shows until selected.
+        self.fai_mode_combo.addItems(["", "Create New FAI", "Open Existing FAI"])
+        try:
+            self.fai_mode_combo.setCurrentIndex(0)
+        except Exception:
+            pass
+        self.fai_mode_combo.currentTextChanged.connect(self._on_fai_mode_changed)
+
+        mode_layout.addRow("Mode:", self.fai_mode_combo)
+
         file_group = QGroupBox("Input Files")
         file_layout = QFormLayout(file_group)
         file_layout.setContentsMargins(8, 8, 8, 8)
@@ -972,7 +1549,12 @@ class MainWindow(QMainWindow):
         machine_chr_layout.addWidget(self.chr_path_edit)
         machine_chr_layout.addWidget(self.chr_browse_btn)
         file_layout.addRow("Machine / Calypso File (*.txt):", machine_chr_widget)
-        file_layout.addRow("Drawing PDF:", self.create_file_row(self.drawing_pdf_edit, self.drawing_pdf_browse_btn))
+
+        drawing_group = QGroupBox("Drawing")
+        drawing_layout = QFormLayout(drawing_group)
+        drawing_layout.setContentsMargins(8, 8, 8, 8)
+        drawing_layout.setSpacing(6)
+        drawing_layout.addRow("Drawing PDF:", self.create_file_row(self.drawing_pdf_edit, self.drawing_pdf_browse_btn))
 
         template_group = QGroupBox("FAI Template")
         template_layout = QFormLayout(template_group)
@@ -985,9 +1567,45 @@ class MainWindow(QMainWindow):
         self.template_browse_btn.clicked.connect(self.browse_template)
         template_layout.addRow("Template (*.xlsx):", self.create_file_row(self.template_path_edit, self.template_browse_btn))
 
+        existing_group = QGroupBox("Existing FAI")
+        existing_layout = QFormLayout(existing_group)
+        existing_layout.setContentsMargins(8, 8, 8, 8)
+        existing_layout.setSpacing(6)
+
+        self.existing_fai_path_edit = QLineEdit()
+        self.existing_fai_path_edit.setPlaceholderText("Drop Existing FAI XLSX here")
+        self.existing_fai_browse_btn = QPushButton("Browse")
+        self.existing_fai_browse_btn.clicked.connect(self.browse_existing_fai)
+        existing_layout.addRow(
+            "Existing FAI (*.xlsx):",
+            self.create_file_row(self.existing_fai_path_edit, self.existing_fai_browse_btn),
+        )
+
+        inputs_layout.addWidget(mode_group)
+        # Existing FAI should appear directly under Mode (only when that mode is selected).
+        inputs_layout.addWidget(existing_group)
         inputs_layout.addWidget(file_group)
+        inputs_layout.addWidget(drawing_group)
         inputs_layout.addWidget(template_group)
         inputs_layout.addStretch(1)
+
+        # Keep group boxes accessible for mode enable/disable behavior.
+        self._inputs_file_group = file_group
+        self._inputs_template_group = template_group
+        self._inputs_existing_group = existing_group
+        self._inputs_drawing_group = drawing_group
+
+        # Start hidden until a mode is chosen.
+        try:
+            file_group.setVisible(False)
+            drawing_group.setVisible(False)
+            template_group.setVisible(False)
+            existing_group.setVisible(False)
+        except Exception:
+            pass
+
+        # Apply initial enable/disable based on current mode.
+        QTimer.singleShot(0, lambda: self._on_fai_mode_changed(self.fai_mode_combo.currentText()))
         
         # Forms (tabs)
         self.forms_tabs = QTabWidget()
@@ -1070,6 +1688,15 @@ class MainWindow(QMainWindow):
         self.forms_tabs.addTab(calibrated_equipment_tab, "Calibrated Equipment")
 
         self.forms_tabs.addTab(inputs_tab, "Inputs")
+
+        # Per request: default to the Inputs tab on startup.
+        try:
+            self.forms_tabs.setCurrentWidget(inputs_tab)
+        except Exception:
+            try:
+                self.forms_tabs.setCurrentIndex(max(0, self.forms_tabs.count() - 1))
+            except Exception:
+                pass
 
 
 
@@ -4443,7 +5070,7 @@ class MainWindow(QMainWindow):
                 continue
             self._form_sheet_names[remaining_keys.pop(0)] = name
 
-    def load_template(self):
+    def load_template(self, *, persist_settings: bool = True):
         if not self.template_path or not os.path.exists(self.template_path):
             self._template_wb = None
             for v in self._form_viewers.values():
@@ -4465,7 +5092,11 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        self._settings.setValue("paths/template", self.template_path)
+        if persist_settings:
+            try:
+                self._settings.setValue("paths/template", self.template_path)
+            except Exception:
+                pass
 
         self._detect_form_sheets(self._template_wb)
 
@@ -4544,6 +5175,14 @@ class MainWindow(QMainWindow):
             if viewer is None or not sheet_name:
                 continue
             ws = self._template_wb[sheet_name]
+
+            # Trim away unused columns/rows so the UI stays responsive and the
+            # workbook stays small (applies to both Create New and Open Existing).
+            try:
+                if self._is_open_existing_fai_mode() or self._is_create_new_fai_mode():
+                    self._trim_existing_fai_sheet(ws, form_key=str(form_key))
+            except Exception:
+                pass
             if form_key == "1":
                 self._ensure_form1_reason_dropdown(ws)
                 self._ensure_supplier_directory_dropdown(ws, cell_range="E15:E500")
@@ -4592,7 +5231,11 @@ class MainWindow(QMainWindow):
             viewer.set_worksheet(ws)
             # Persist any existing Calypso data into Form 3 worksheet.
             if form_key == "3" and self.characteristics:
-                self._write_form3_to_worksheet(ws)
+                try:
+                    if not self._is_open_existing_fai_mode():
+                        self._write_form3_to_worksheet(ws)
+                except Exception:
+                    pass
             viewer.set_overrides({})
             viewer.render()
 
@@ -4604,6 +5247,94 @@ class MainWindow(QMainWindow):
         # If the drawing bubbles were loaded before (or during) template load,
         # the initial bubbles_changed may have fired while Form 3 was not ready.
         self._sync_bubbles_to_form3(set(getattr(self, "_last_bubbled_numbers", set()) or set()))
+
+        def _trim_existing_fai_sheet(self, ws, form_key: str = "") -> None:
+                """Trim a loaded FAI worksheet.
+
+                Per request:
+                - Remove columns AA and larger.
+                - Detect the last row that has data, keep 50 rows beyond it, and delete
+                    everything after.
+
+                Notes:
+                - For Form 3, we use the detected end of the characteristic table so
+                    template formulas/formatting rows don't block trimming.
+                - For other forms, we scan for non-empty, non-formula values.
+                """
+
+        if ws is None:
+            return
+
+        # Keep only A:Z.
+        max_col_keep = 26
+
+        # Remove columns AA+.
+        try:
+            max_col = int(getattr(ws, "max_column", 0) or 0)
+        except Exception:
+            max_col = 0
+        try:
+            if max_col > max_col_keep:
+                ws.delete_cols(max_col_keep + 1, max_col - max_col_keep)
+        except Exception:
+            pass
+
+        last_row = 0
+        fk = str(form_key or "").strip().lower()
+
+        # Prefer Form 3 table-aware end detection.
+        if fk == "3":
+            try:
+                layout = self._form3_detect_table_layout(ws)
+                start_row = int(layout.get("start_row") or 6)
+                end_row = self._form3_find_table_end_row(ws, start_row=start_row)
+                last_row = int(end_row)
+            except Exception:
+                last_row = 0
+
+        # Other forms: scan for non-empty, non-formula values.
+        if last_row <= 0:
+            try:
+                cells = getattr(ws, "_cells", {}) or {}
+                for (r, c), cell in list(cells.items()):
+                    try:
+                        rr = int(r)
+                        cc = int(c)
+                    except Exception:
+                        continue
+                    if rr <= 0 or cc <= 0 or cc > max_col_keep:
+                        continue
+                    try:
+                        v = getattr(cell, "value", None)
+                    except Exception:
+                        v = None
+                    if v is None:
+                        continue
+                    if isinstance(v, str):
+                        s = v.strip()
+                        if not s:
+                            continue
+                        # Ignore formulas when determining "has data".
+                        if s.startswith("="):
+                            continue
+                    if rr > last_row:
+                        last_row = rr
+            except Exception:
+                last_row = 0
+
+        keep_extra = 50
+        keep_until = max(1, int(last_row) + int(keep_extra)) if last_row else 1
+
+        # Delete everything after keep_until.
+        try:
+            max_row = int(getattr(ws, "max_row", 0) or 0)
+        except Exception:
+            max_row = 0
+        try:
+            if max_row > keep_until:
+                ws.delete_rows(keep_until + 1, max_row - keep_until)
+        except Exception:
+            pass
 
     def _ensure_supplier_directory_sheet(self, wb):
         """Ensure a hidden supplier directory sheet exists.
@@ -8646,7 +9377,212 @@ class MainWindow(QMainWindow):
             self.template_path = path
             self.template_path_edit.setText(path)
             self._settings.setValue("paths/template", path)
-            self.load_template()
+            self.load_template(persist_settings=True)
+
+    def browse_existing_fai(self) -> None:
+        start_dir = ""
+        try:
+            cur = str(self.existing_fai_path_edit.text() or "").strip()
+            if cur:
+                start_dir = os.path.dirname(cur)
+        except Exception:
+            start_dir = ""
+        if not start_dir:
+            try:
+                start_dir = str(self._settings.value("last_dir/existing_fai", "") or "").strip()
+            except Exception:
+                start_dir = ""
+        if not start_dir:
+            try:
+                last_existing = str(self._settings.value("paths/existing_fai", "") or "").strip()
+                if last_existing:
+                    start_dir = os.path.dirname(last_existing)
+            except Exception:
+                start_dir = ""
+
+        path, _ = QFileDialog.getOpenFileName(self, "Open Existing FAI", start_dir, "Excel Files (*.xlsx);;All Files (*)")
+        if path:
+            self._set_existing_fai_path(path)
+
+    def _set_existing_fai_path(self, path: str) -> None:
+        p = str(path or "").strip()
+        if not p:
+            return
+        try:
+            if hasattr(self, "existing_fai_path_edit") and self.existing_fai_path_edit is not None:
+                self.existing_fai_path_edit.setText(p)
+        except Exception:
+            pass
+
+        # Clear any previously loaded Calypso data so we don't regenerate Form 3
+        # on an existing workbook.
+        try:
+            self.characteristics = []
+        except Exception:
+            pass
+
+        # Default Auto Add to unchecked for Existing FAI.
+        try:
+            self._set_form3_include_thread_extras(False, persist=True, update_ui=True)
+        except Exception:
+            pass
+
+        try:
+            self._settings.setValue("paths/existing_fai", p)
+            try:
+                self._settings.setValue("last_dir/existing_fai", os.path.dirname(p))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # Use the same workbook-loading path as template selection, but do not
+        # overwrite the stored template path.
+        try:
+            self.template_path = p
+            self.load_template(persist_settings=False)
+        except Exception as e:
+            QMessageBox.warning(self, "Template Error", f"Failed to load existing FAI:\n{e}")
+            return
+
+    def _is_open_existing_fai_mode(self) -> bool:
+        try:
+            if hasattr(self, "fai_mode_combo") and self.fai_mode_combo is not None:
+                mode = str(self.fai_mode_combo.currentText() or "").strip().lower()
+                return mode.startswith("open")
+        except Exception:
+            pass
+        try:
+            mode = str(self._settings.value("inputs/fai_mode", "") or "").strip().lower()
+            return mode.startswith("open")
+        except Exception:
+            return False
+
+    def _is_create_new_fai_mode(self) -> bool:
+        try:
+            if hasattr(self, "fai_mode_combo") and self.fai_mode_combo is not None:
+                mode = str(self.fai_mode_combo.currentText() or "").strip().lower()
+                return mode.startswith("create")
+        except Exception:
+            pass
+        try:
+            mode = str(self._settings.value("inputs/fai_mode", "") or "").strip().lower()
+            return mode.startswith("create")
+        except Exception:
+            return False
+
+    def _on_fai_mode_changed(self, mode_text: str) -> None:
+        mode = str(mode_text or "").strip()
+        try:
+            self._settings.setValue("inputs/fai_mode", mode)
+        except Exception:
+            pass
+
+        m = mode.lower()
+        is_blank = (m == "")
+        is_create = m.startswith("create")
+        is_open = m.startswith("open")
+
+        # Show/hide groups per requested UX.
+        try:
+            g = getattr(self, "_inputs_existing_group", None)
+            if g is not None:
+                g.setVisible(bool(is_open))
+        except Exception:
+            pass
+        try:
+            g = getattr(self, "_inputs_file_group", None)
+            if g is not None:
+                g.setVisible(bool(is_create))
+        except Exception:
+            pass
+        try:
+            g = getattr(self, "_inputs_drawing_group", None)
+            if g is not None:
+                g.setVisible(bool(is_create or is_open))
+        except Exception:
+            pass
+        try:
+            g = getattr(self, "_inputs_template_group", None)
+            if g is not None:
+                g.setVisible(bool(is_create))
+        except Exception:
+            pass
+
+        # Blank mode: clear everything and hide all groups.
+        if is_blank:
+            try:
+                self.characteristics = []
+            except Exception:
+                pass
+            try:
+                self.chr_path_edit.setText("")
+            except Exception:
+                pass
+            try:
+                self.template_path_edit.setText("")
+            except Exception:
+                pass
+            try:
+                self.drawing_pdf_edit.setText("")
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "existing_fai_path_edit") and self.existing_fai_path_edit is not None:
+                    self.existing_fai_path_edit.setText("")
+            except Exception:
+                pass
+            try:
+                self.template_path = ""
+                self.drawing_pdf_path = ""
+            except Exception:
+                pass
+            try:
+                self.load_template(persist_settings=False)
+            except Exception:
+                pass
+            return
+
+        # Switching between create/open: clear unrelated inputs.
+        if is_open:
+            # Default Auto Add to unchecked for Existing FAI.
+            try:
+                self._set_form3_include_thread_extras(False, persist=True, update_ui=True)
+            except Exception:
+                pass
+            # Ensure Calypso-driven Form 3 can't be regenerated.
+            try:
+                self.characteristics = []
+            except Exception:
+                pass
+            try:
+                self.chr_path_edit.setText("")
+            except Exception:
+                pass
+            try:
+                self.template_path_edit.setText("")
+            except Exception:
+                pass
+            try:
+                self.drawing_pdf_edit.setText("")
+            except Exception:
+                pass
+            try:
+                self.template_path = ""
+                self.drawing_pdf_path = ""
+            except Exception:
+                pass
+            try:
+                self.load_template(persist_settings=False)
+            except Exception:
+                pass
+
+        if is_create:
+            try:
+                if hasattr(self, "existing_fai_path_edit") and self.existing_fai_path_edit is not None:
+                    self.existing_fai_path_edit.setText("")
+            except Exception:
+                pass
 
     def browse_drawing_pdf(self):
         start_dir = ""
@@ -8743,6 +9679,23 @@ class MainWindow(QMainWindow):
         self._set_drawing_pdf_path(p, load_viewer=True)
 
     def load_chr(self, path):
+        # In "Open Existing FAI" mode, do not allow Calypso input to overwrite
+        # any forms. (Input Files are disabled, but drag/drop and other paths
+        # can still call this.)
+        try:
+            if self._is_open_existing_fai_mode():
+                try:
+                    self.chr_path_edit.setText(path)
+                except Exception:
+                    pass
+                try:
+                    self._settings.setValue("paths/chr", path)
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+
         # Per request: whenever a Calypso file is selected/loaded, force the
         # Form 3 auto-add option to start unchecked.
         try:
@@ -8871,14 +9824,24 @@ class MainWindow(QMainWindow):
             if f.lower().endswith('.txt'):
                 self.load_chr(f)
             elif f.lower().endswith('.xlsx'):
-                self.template_path = f
-                self.template_path_edit.setText(f)
-                self._settings.setValue("paths/template", f)
+                mode = ""
                 try:
-                    self._settings.setValue("last_dir/template", os.path.dirname(f))
+                    if hasattr(self, "fai_mode_combo") and self.fai_mode_combo is not None:
+                        mode = str(self.fai_mode_combo.currentText() or "").strip()
                 except Exception:
-                    pass
-                self.load_template()
+                    mode = ""
+
+                if mode.lower().startswith("open"):
+                    self._set_existing_fai_path(f)
+                else:
+                    self.template_path = f
+                    self.template_path_edit.setText(f)
+                    self._settings.setValue("paths/template", f)
+                    try:
+                        self._settings.setValue("last_dir/template", os.path.dirname(f))
+                    except Exception:
+                        pass
+                    self.load_template(persist_settings=True)
             elif f.lower().endswith('.pdf'):
                 self._set_drawing_pdf_path(f, load_viewer=True)
 

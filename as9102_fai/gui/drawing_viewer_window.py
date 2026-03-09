@@ -996,6 +996,8 @@ class DrawingViewerWindow(QMainWindow):
         notes_l.addWidget(v.extract_notes_btn)
         notes_l.addStretch(1)
 
+        # Visual: Notes Window button indicates active state; keep the dock background unchanged.
+
         # Actions dock
         actions_page = QWidget()
         actions_l = QVBoxLayout(actions_page)

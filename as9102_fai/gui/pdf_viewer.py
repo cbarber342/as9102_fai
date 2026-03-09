@@ -2066,6 +2066,15 @@ class PdfViewer(QWidget):
         self.add_note_region_btn.setCheckable(True)
         self.add_note_region_btn.clicked.connect(self.toggle_note_region_mode)
 
+        # Visual: show active state (checked) as light blue.
+        try:
+            self.add_note_region_btn.setStyleSheet(
+                "QPushButton:checked { background-color: #ADD8E6; color: #000; }"
+                "QPushButton:pressed { background-color: #ADD8E6; }"
+            )
+        except Exception:
+            pass
+
         self.clear_note_regions_btn = QPushButton("Clear Notes Window")
         self.clear_note_regions_btn.clicked.connect(self.clear_note_regions)
 
@@ -4003,6 +4012,36 @@ class PdfViewer(QWidget):
         self._did_initial_fit = True
 
     def _pdf_text_in_clip(self, page: fitz.Page, clip: fitz.Rect | None) -> str:
+        # Prefer extracting from a display list with annotations disabled so
+        # embedded bubbles/annotations don't contaminate notes.
+        try:
+            dl = page.get_displaylist(annots=False)
+            tp = dl.get_textpage(clip=clip)
+            try:
+                blocks = tp.extractBLOCKS()  # type: ignore[attr-defined]
+                parts: list[str] = []
+                for b in sorted(blocks or [], key=lambda t: (round(float(t[1]), 2), round(float(t[0]), 2))):
+                    try:
+                        txt = str(b[4] or "")
+                    except Exception:
+                        txt = ""
+                    txt = txt.strip()
+                    if txt:
+                        parts.append(txt)
+                s = "\n".join(parts).strip()
+                if s:
+                    return s
+            except Exception:
+                # Fallback: plain text extraction from the textpage.
+                try:
+                    s = str(tp.extractTEXT() or "").strip()  # type: ignore[attr-defined]
+                except Exception:
+                    s = ""
+                if s:
+                    return s
+        except Exception:
+            pass
+
         # Prefer block-based extraction and sort blocks top-to-bottom, left-to-right.
         # This improves ordering for engineering drawings where PDF internal reading
         # order is often non-visual (e.g., footers can appear first).
@@ -4064,7 +4103,20 @@ class PdfViewer(QWidget):
             # We use 3.0 (approx 216 DPI) for better recognition of small text.
             ocr_scale = 3.0
             mat = fitz.Matrix(ocr_scale, ocr_scale)
-            pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
+
+            # Render without annotations so embedded bubbles don't get OCR'd.
+            pix = None
+            try:
+                dl = page.get_displaylist(annots=False)
+                pix = dl.get_pixmap(matrix=mat, clip=clip, alpha=False)
+            except Exception:
+                pix = None
+
+            if pix is None:
+                try:
+                    pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False, annots=False)
+                except TypeError:
+                    pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
             
             # Convert directly to PIL Image (faster than png bytes)
             mode = "RGB" if pix.n == 3 else "RGBA"
