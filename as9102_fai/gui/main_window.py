@@ -403,6 +403,7 @@ DEFAULT_CALIBRATED_EQUIPMENT_SEED: list[tuple[str, str, str, str]] = [
 ]
 
 from as9102_fai.parsers.chr_parser import ChrParser
+from as9102_fai.parsers.chr_parser import FaiCharacteristic
 from as9102_fai.gui.pdf_viewer import PdfViewer
 from as9102_fai.gui.drawing_viewer_window import DrawingViewerWindow
 from as9102_fai.reports.fai_generator import FaiGenerator
@@ -430,6 +431,9 @@ class MainWindow(QMainWindow):
         self._form_viewers = {"1": None, "2": None, "2c": None, "3": None}
         self._supplier_directory_table = None
         self._supplier_directory_suppress_changes = False
+
+        # Threads tab state
+        self._threads_table = None
 
         # Calibrated Equipment tab state
         self._calibrated_equipment_table = None
@@ -687,12 +691,18 @@ class MainWindow(QMainWindow):
         """
         out: list[object] = []
         for char in (getattr(self, "characteristics", None) or []):
+            try:
+                src = str(getattr(char, "source", "calypso") or "calypso").strip().lower()
+            except Exception:
+                src = "calypso"
+            try:
+                is_attr = bool(getattr(char, "is_attribute", False))
+            except Exception:
+                is_attr = False
+
             if not include_thread_extras:
-                try:
-                    if str(getattr(char, "source", "calypso") or "calypso").strip().lower() != "calypso":
-                        continue
-                except Exception:
-                    pass
+                if src != "calypso":
+                    continue
 
             description_text = f"{getattr(char, 'id', '')}".strip()
             if not description_text:
@@ -705,19 +715,27 @@ class MainWindow(QMainWindow):
             if spec_text and "nan" in spec_text.lower():
                 continue
 
-            try:
-                src = str(getattr(char, "source", "calypso") or "calypso").strip().lower()
-            except Exception:
-                src = "calypso"
-            try:
-                is_attr = bool(getattr(char, "is_attribute", False))
-            except Exception:
-                is_attr = False
-
-            if not spec_text and src == "calypso" and not is_attr:
+            # Historically, Form 3 skipped blank-spec Calypso rows. However, thread
+            # characteristics can be attribute-like and still need derived rows.
+            rule = None
+            if include_thread_extras and src == "calypso" and (not is_attr):
+                try:
+                    rule = self._thread_rule_for_char(char)
+                except Exception:
+                    rule = None
+            if not spec_text and src == "calypso" and not is_attr and not rule:
                 continue
 
             out.append(char)
+
+            # If Auto add Go/No Go is enabled, append derived rows per the Threads table.
+            if include_thread_extras and src == "calypso" and (not is_attr):
+                if rule:
+                    try:
+                        out.extend(self._derived_thread_rows_for_char(char, rule))
+                    except Exception:
+                        pass
+
         return out
 
     def _form3_bubble_number_mapping(self, *, from_include_thread_extras: bool, to_include_thread_extras: bool) -> dict[int, int]:
@@ -1041,6 +1059,9 @@ class MainWindow(QMainWindow):
 
         customer_tab = self._create_suppliers_tab()
         self.forms_tabs.addTab(customer_tab, "Customer")
+
+        threads_tab = self._create_threads_tab()
+        self.forms_tabs.addTab(threads_tab, "Threads")
 
         supplier_tab = self._create_supplier_directory_tab()
         self.forms_tabs.addTab(supplier_tab, "Supplier")
@@ -1561,6 +1582,452 @@ class MainWindow(QMainWindow):
         table.itemChanged.connect(lambda _it: self._save_suppliers_from_tab())
 
         return container
+
+    def _default_thread_rules_rows(self) -> list[dict[str, object]]:
+        """Default thread rules (matches prior hardcoded behavior).
+
+        Each row is:
+          pattern: regex (case-insensitive)
+          rows_to_add: int
+          suffixes: list[str] length 10
+        """
+        # NOTE: The Threads tab now supports simple keywords (preferred) as well as
+        # regex patterns. We seed keywords for the common families so users can
+        # edit without needing regex syntax.
+        defaults = [
+            # Metric threads (simple token). Matches any M6/M6x1.
+            "M",
+            # Unified
+            "UN",
+            "UNC",
+            "UNF",
+            "UNEF",
+            "UNJ",
+            "UNJC",
+            "UNJF",
+            # Pipe
+            "NPT",
+            "NPTF",
+            # BSP
+            "BSP",
+            "BSPT",
+            # Other
+            "STI",
+            "ACME",
+            "STUB ACME",
+            "WHITWORTH",
+        ]
+        out: list[dict[str, object]] = []
+        for pat in defaults:
+            out.append(
+                {
+                    "pattern": str(pat),
+                    "rows_to_add": 2,
+                    "suffixes": ["Go/No Go", "Minor", "", "", "", "", "", "", "", ""],
+                }
+            )
+        return out
+
+    def _load_persistent_thread_rules_rows(self) -> list[dict[str, object]]:
+        try:
+            raw = self._settings.value("lists/thread_rules_rows", "", type=str)
+        except Exception:
+            raw = ""
+        if not raw:
+            return self._default_thread_rules_rows()
+        try:
+            data = json.loads(str(raw))
+        except Exception:
+            return self._default_thread_rules_rows()
+        if not isinstance(data, list):
+            return self._default_thread_rules_rows()
+
+        def _maybe_demote_regex_to_keyword(pat: str) -> str:
+            """Convert simple word-boundary regex (e.g. '\\bUNC\\b') to 'UNC'.
+
+            Also converts '\\bSTUB\\s+ACME\\b' -> 'STUB ACME' when safe.
+            Leaves true regex patterns intact (e.g. metric M\\d+ pattern).
+            """
+            s = str(pat or "").strip()
+            if not s:
+                return ""
+
+            # Migrate the original hardcoded metric pattern to the simple token.
+            if s == r"\bM\d+(?:x\d+)?\b":
+                return "M"
+
+            if not (s.startswith(r"\b") and s.endswith(r"\b")):
+                return s
+            inner = s[2:-2]
+            # Handle common whitespace regex tokens.
+            try:
+                inner2 = inner
+                inner2 = inner2.replace(r"\s+", " ")
+                inner2 = inner2.replace(r"\s*", " ")
+                inner2 = re.sub(r"\s+", " ", inner2).strip()
+            except Exception:
+                inner2 = inner.strip()
+
+            # If the inner still looks like real regex (digits/classes/groups/etc), keep original.
+            try:
+                if any(ch in inner for ch in ("[", "]", "(", ")", "?", "+", "*", "{", "}", "|", ".", "^", "$")):
+                    # Allow the specific whitespace-regex demotion if it became a plain phrase.
+                    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _/\-]*", inner2 or ""):
+                        return inner2
+                    return s
+                if "\\" in inner:
+                    # If the only backslashes were for whitespace and we demoted successfully, use it.
+                    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _/\-]*", inner2 or ""):
+                        return inner2
+                    return s
+            except Exception:
+                return s
+
+            # Plain word.
+            return inner2 or inner.strip()
+
+        rows: list[dict[str, object]] = []
+        for it in data:
+            if not isinstance(it, dict):
+                continue
+            pat = str(it.get("pattern", "") or "").strip()
+            pat = _maybe_demote_regex_to_keyword(pat)
+            if not pat:
+                continue
+            try:
+                rta = int(it.get("rows_to_add", 0) or 0)
+            except Exception:
+                rta = 0
+            rta = max(0, min(10, int(rta)))
+
+            suf = it.get("suffixes", [])
+            if not isinstance(suf, list):
+                suf = []
+            suffixes: list[str] = [str(x or "").strip() for x in suf[:10]]
+            while len(suffixes) < 10:
+                suffixes.append("")
+
+            rows.append({"pattern": pat, "rows_to_add": rta, "suffixes": suffixes})
+
+        # Persist migration (best-effort) so the UI shows simple tokens next run.
+        if rows:
+            try:
+                self._save_persistent_thread_rules_rows(rows)
+            except Exception:
+                pass
+
+        return rows or self._default_thread_rules_rows()
+
+    def _save_persistent_thread_rules_rows(self, rows: list[dict[str, object]]) -> None:
+        payload: list[dict[str, object]] = []
+        for it in rows or []:
+            if not isinstance(it, dict):
+                continue
+            pat = str(it.get("pattern", "") or "").strip()
+            if not pat:
+                continue
+            try:
+                rta = int(it.get("rows_to_add", 0) or 0)
+            except Exception:
+                rta = 0
+            rta = max(0, min(10, int(rta)))
+
+            suf = it.get("suffixes", [])
+            if not isinstance(suf, list):
+                suf = []
+            suffixes: list[str] = [str(x or "").strip() for x in suf[:10]]
+            while len(suffixes) < 10:
+                suffixes.append("")
+
+            payload.append({"pattern": pat, "rows_to_add": rta, "suffixes": suffixes})
+
+        try:
+            self._settings.setValue("lists/thread_rules_rows", json.dumps(payload))
+        except Exception:
+            pass
+
+    def _threads_rows_from_tab(self) -> list[dict[str, object]]:
+        table = getattr(self, "_threads_table", None)
+        if table is None:
+            return self._load_persistent_thread_rules_rows()
+
+        rows: list[dict[str, object]] = []
+        try:
+            rc = int(table.rowCount())
+        except Exception:
+            rc = 0
+
+        for r in range(rc):
+            try:
+                pat_item = table.item(r, 0)
+                pat = str(pat_item.text() if pat_item is not None else "").strip()
+            except Exception:
+                pat = ""
+            if not pat:
+                continue
+
+            try:
+                cnt_item = table.item(r, 1)
+                cnt_raw = str(cnt_item.text() if cnt_item is not None else "").strip()
+                rows_to_add = int(cnt_raw) if cnt_raw else 0
+            except Exception:
+                rows_to_add = 0
+            rows_to_add = max(0, min(10, int(rows_to_add)))
+
+            suffixes: list[str] = []
+            for c in range(2, 12):
+                try:
+                    it = table.item(r, c)
+                    suffixes.append(str(it.text() if it is not None else "").strip())
+                except Exception:
+                    suffixes.append("")
+            while len(suffixes) < 10:
+                suffixes.append("")
+
+            rows.append({"pattern": pat, "rows_to_add": rows_to_add, "suffixes": suffixes[:10]})
+
+        return rows or self._default_thread_rules_rows()
+
+    def _save_threads_from_tab(self) -> None:
+        try:
+            self._save_persistent_thread_rules_rows(self._threads_rows_from_tab())
+        except Exception:
+            pass
+
+    def _create_threads_tab(self) -> QWidget:
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        header = QWidget()
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+
+        add_btn = QPushButton("Add")
+        del_btn = QPushButton("Delete")
+        header_layout.addWidget(add_btn)
+        header_layout.addWidget(del_btn)
+        header_layout.addStretch()
+        layout.addWidget(header)
+
+        table = QTableWidget()
+        table.setColumnCount(12)
+        headers = ["Threads to Detect", "Rows to Add"] + [f"{i}st Suffix" if i == 1 else (f"{i}nd Suffix" if i == 2 else (f"{i}rd Suffix" if i == 3 else f"{i}th Suffix")) for i in range(1, 11)]
+        table.setHorizontalHeaderLabels(headers)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setStretchLastSection(False)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        table.verticalHeader().setDefaultSectionSize(24)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+            | QAbstractItemView.EditTrigger.AnyKeyPressed
+        )
+
+        self._install_delete_clears_cells(table)
+        layout.addWidget(table)
+
+        self._register_persistent_table(table, "tables/threads")
+        self._threads_table = table
+
+        # Populate from settings (or defaults).
+        rows = self._load_persistent_thread_rules_rows()
+        try:
+            table.blockSignals(True)
+            table.setRowCount(0)
+            for rr, row in enumerate(rows):
+                table.insertRow(rr)
+                pat = str(row.get("pattern", "") or "").strip()
+                rta = str(int(row.get("rows_to_add", 0) or 0))
+                suffixes = row.get("suffixes", [])
+                if not isinstance(suffixes, list):
+                    suffixes = []
+                suffixes = [str(x or "").strip() for x in suffixes[:10]]
+                while len(suffixes) < 10:
+                    suffixes.append("")
+
+                table.setItem(rr, 0, QTableWidgetItem(pat))
+                table.setItem(rr, 1, QTableWidgetItem(rta))
+                for i in range(10):
+                    table.setItem(rr, 2 + i, QTableWidgetItem(suffixes[i]))
+        finally:
+            table.blockSignals(False)
+
+        def _add_row() -> None:
+            if self._threads_table is None:
+                return
+            table = self._threads_table
+            try:
+                table.blockSignals(True)
+                r = table.rowCount()
+                table.insertRow(r)
+                for c in range(12):
+                    table.setItem(r, c, QTableWidgetItem(""))
+            finally:
+                table.blockSignals(False)
+            table.setCurrentCell(r, 0)
+            table.editItem(table.item(r, 0))
+
+        def _delete_rows() -> None:
+            if self._threads_table is None:
+                return
+            rows = sorted({idx.row() for idx in self._threads_table.selectionModel().selectedRows()}, reverse=True)
+            if not rows:
+                return
+            for r in rows:
+                self._threads_table.removeRow(r)
+            self._save_threads_from_tab()
+
+        add_btn.clicked.connect(_add_row)
+        del_btn.clicked.connect(_delete_rows)
+        table.itemChanged.connect(lambda _it: self._save_threads_from_tab())
+
+        return container
+
+    def _thread_rule_for_char(self, char: object) -> dict[str, object] | None:
+        """Return the first matching thread rule for this characteristic (or None)."""
+        try:
+            text = " ".join(
+                [
+                    str(getattr(char, "id", "") or ""),
+                    str(getattr(char, "feature_name", "") or ""),
+                    str(getattr(char, "description", "") or ""),
+                    str(getattr(char, "type", "") or ""),
+                    str(getattr(char, "comment", "") or ""),
+                ]
+            )
+        except Exception:
+            text = ""
+        if not text.strip():
+            return None
+
+        rules = self._threads_rows_from_tab()
+
+        # Use alphanumeric boundaries instead of \b so tokens match when adjacent
+        # to underscores (common in Calypso feature IDs like "..._UNC").
+        metric_rx = re.compile(r"(?<![A-Za-z0-9])M\d+(?:x\d+)?(?![A-Za-z0-9])", flags=re.IGNORECASE)
+        for rule in rules:
+            try:
+                pat = str(rule.get("pattern", "") or "").strip()
+            except Exception:
+                pat = ""
+            if not pat:
+                continue
+
+            # Support both:
+            # - Simple tokens: "UN", "UNC", "M6x1" (matched as whole words)
+            # - Regex: any pattern containing regex metacharacters (e.g. "\\bUNC\\b")
+            tokens: list[str] = []
+            try:
+                tokens = [t.strip() for t in re.split(r"[;,\n\r\t ]+", pat) if t.strip()]
+            except Exception:
+                tokens = [pat]
+            if not tokens:
+                tokens = [pat]
+
+            def _looks_like_regex(s: str) -> bool:
+                # Heuristic: if user typed obvious regex constructs, treat as regex.
+                return any(ch in s for ch in ("\\", "[", "]", "(", ")", "?", "+", "*", "{", "}", "|", ".", "^", "$"))
+
+            for tok in tokens:
+                if not tok:
+                    continue
+                try:
+                    if tok.strip().upper() == "M":
+                        if metric_rx.search(text):
+                            return rule
+                        continue
+                    if _looks_like_regex(tok):
+                        rx = re.compile(tok, flags=re.IGNORECASE)
+                    else:
+                        # Whole-token match using alphanumeric boundaries so "_UNC" matches.
+                        rx = re.compile(
+                            r"(?<![A-Za-z0-9])" + re.escape(tok) + r"(?![A-Za-z0-9])",
+                            flags=re.IGNORECASE,
+                        )
+                    if rx.search(text):
+                        return rule
+                except Exception:
+                    # Last-resort: substring match
+                    try:
+                        if tok.lower() in text.lower():
+                            return rule
+                    except Exception:
+                        continue
+        return None
+
+    def _derived_thread_rows_for_char(self, char: object, rule: dict[str, object]) -> list[object]:
+        try:
+            base_id = str(getattr(char, "id", "") or "").strip()
+        except Exception:
+            base_id = ""
+        try:
+            base_feat = str(getattr(char, "feature_name", "") or "").strip()
+        except Exception:
+            base_feat = ""
+        try:
+            unit = str(getattr(char, "unit", "") or "")
+        except Exception:
+            unit = ""
+        try:
+            group1 = str(getattr(char, "group1", "") or "")
+        except Exception:
+            group1 = ""
+
+        try:
+            rows_to_add = int(rule.get("rows_to_add", 0) or 0)
+        except Exception:
+            rows_to_add = 0
+        rows_to_add = max(0, min(10, int(rows_to_add)))
+
+        suf = rule.get("suffixes", [])
+        if not isinstance(suf, list):
+            suf = []
+        suffixes = [str(x or "").strip() for x in suf[:10]]
+        while len(suffixes) < 10:
+            suffixes.append("")
+
+        out: list[object] = []
+        for i in range(rows_to_add):
+            suffix = str(suffixes[i] or "").strip()
+            if not suffix:
+                continue
+
+            # Use the suffix as the derived row's ID/FeatureName suffix.
+            d_id = (base_id + " " + suffix).strip() if base_id else str(suffix)
+            d_feat = (base_feat + " " + suffix).strip() if base_feat else str(suffix)
+
+            nominal = ""
+            try:
+                if re.search(r"go\s*/?\s*no", suffix, flags=re.IGNORECASE):
+                    nominal = "Pass"
+            except Exception:
+                nominal = nominal
+
+            out.append(
+                FaiCharacteristic(
+                    id=d_id,
+                    feature_name=d_feat,
+                    description="",
+                    actual="",
+                    nominal=nominal,
+                    upper_tol="",
+                    lower_tol="",
+                    type="Attribute",
+                    unit=unit,
+                    group1=group1,
+                    source="derived",
+                    is_thread=True,
+                    is_attribute=True,
+                    comment="",
+                )
+            )
+
+        return out
 
     def _create_supplier_directory_tab(self) -> QWidget:
         container = QWidget()
@@ -5240,7 +5707,12 @@ class MainWindow(QMainWindow):
                 except Exception:
                     continue
 
-        for char in self.characteristics:
+        try:
+            include_thread_extras = bool(getattr(self, "_form3_include_thread_extras", True))
+        except Exception:
+            include_thread_extras = True
+
+        for char in self._iter_form3_characteristics_for_write(include_thread_extras=include_thread_extras):
             # Optionally hide derived thread rows (Go/No-Go, Minor Dia, etc.)
             # when the Form 3 checkbox is unchecked.
             if not bool(getattr(self, "_form3_include_thread_extras", True)):
@@ -5276,7 +5748,15 @@ class MainWindow(QMainWindow):
             except Exception:
                 is_attr = False
             if not spec_text and src == "calypso" and not is_attr:
-                continue
+                # Allow thread-matched rows through when Auto Add is enabled.
+                allow_blank_spec = False
+                try:
+                    if bool(getattr(self, "_form3_include_thread_extras", False)):
+                        allow_blank_spec = bool(self._thread_rule_for_char(char))
+                except Exception:
+                    allow_blank_spec = False
+                if not allow_blank_spec:
+                    continue
 
             row_num += 1
 
@@ -5318,7 +5798,8 @@ class MainWindow(QMainWindow):
                     str(getattr(char, "feature_name", "") or ""),
                 ]
             )
-            is_basic = bool(re.search(r"\bbasic\b", basic_text, flags=re.IGNORECASE))
+            # Treat both 'Basic' and the common abbreviation 'BSC' as basic dimensions.
+            is_basic = bool(re.search(r"\b(?:basic|bsc)\b", basic_text, flags=re.IGNORECASE))
 
             # GD&T callout (best-effort) from Calypso/spec text.
             if gdt_col is not None and enable_gdt_callout and not is_basic:
@@ -5435,7 +5916,7 @@ class MainWindow(QMainWindow):
 
             # Results column (template-dependent; default is L/12).
             # Per request:
-            # - If the word 'Basic' appears in the description/note text, Results must be 'NA'.
+            # - If 'Basic' or 'BSC' appears in the description/note text, Results must be 'NA'.
             # - Otherwise, numeric results should always be positive and displayed to 4 decimals.
 
             # Ensure GD&T callout stays blank (and explicitly clear template formulas).
@@ -7310,7 +7791,6 @@ class MainWindow(QMainWindow):
                     print("Form3 undo requested: no snapshot available")
                 except Exception:
                     pass
-                QMessageBox.information(self, "Undo", "No Form 3 delete undo is available.")
             except Exception:
                 pass
             return False

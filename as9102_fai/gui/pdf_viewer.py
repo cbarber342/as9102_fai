@@ -2694,9 +2694,13 @@ class PdfViewer(QWidget):
 
         if self.placing_mode:
             try:
-                self._set_pending_bubble_number(self._lowest_available_number())
+                desired = int(self._pending_bubble_number())
+                self._set_pending_bubble_number(self._next_available_number_at_or_after(int(desired)))
             except Exception:
-                self._set_pending_bubble_number(int(self.next_bubble_number))
+                try:
+                    self._set_pending_bubble_number(self._next_available_number_at_or_after(int(self.next_bubble_number)))
+                except Exception:
+                    self._set_pending_bubble_number(int(self.next_bubble_number))
             self.add_bubble_btn.setText("Click to place")
         else:
             self.add_bubble_btn.setText("Add Bubble")
@@ -2755,9 +2759,20 @@ class PdfViewer(QWidget):
             n += 1
         return int(n)
 
+    def _next_available_number_at_or_after(self, start: int) -> int:
+        """Return the next free bubble number >= start."""
+        existing = self._existing_bubbled_numbers()
+        try:
+            n = max(1, min(9999, int(start)))
+        except Exception:
+            n = 1
+        while n in existing and n < 9999:
+            n += 1
+        return int(n)
+
     def _on_pending_bubble_number_changed(self, value: int) -> None:
-        # If the user selects a bubble number that already exists, show an error
-        # and move them to the next available number.
+        # If the user selects a bubble number that already exists, silently move
+        # to the next available number >= the chosen value.
         if bool(getattr(self, "_pending_number_adjusting", False)):
             return
 
@@ -2770,14 +2785,9 @@ class PdfViewer(QWidget):
         if not overlap:
             return
 
-        fixed = self._lowest_available_number()
+        fixed = self._next_available_number_at_or_after(n)
         try:
             self._pending_number_adjusting = True
-            QMessageBox.warning(
-                self,
-                "Duplicate Bubble Number",
-                f"Bubble number {n} already exists. Next available is {fixed}.",
-            )
             self._set_pending_bubble_number(fixed)
         finally:
             self._pending_number_adjusting = False
@@ -2968,10 +2978,6 @@ class PdfViewer(QWidget):
         """Handle click in placement mode."""
         if self.placing_mode:
             if self.range_mode:
-                try:
-                    self._set_pending_bubble_number(self._lowest_available_number())
-                except Exception:
-                    pass
                 result = self._prompt_add_range(int(self._pending_bubble_number()))
                 if result is None:
                     return
@@ -2980,7 +2986,7 @@ class PdfViewer(QWidget):
                 self.add_range_bubble(int(start), int(end), scene_pos.x(), scene_pos.y())
 
                 try:
-                    self._set_pending_bubble_number(self._lowest_available_number())
+                    self._set_pending_bubble_number(self._next_available_number_at_or_after(int(end) + 1))
                 except Exception:
                     pass
 
@@ -3003,18 +3009,16 @@ class PdfViewer(QWidget):
             n = int(self._pending_bubble_number())
             overlap = self._range_overlap(n, n)
             if overlap:
-                fixed = self._lowest_available_number()
-                QMessageBox.warning(
-                    self,
-                    "Duplicate Bubble Number",
-                    f"Bubble number {n} already exists. Next available is {fixed}.",
-                )
-                self._set_pending_bubble_number(fixed)
+                try:
+                    fixed = self._next_available_number_at_or_after(int(n))
+                    self._set_pending_bubble_number(fixed)
+                except Exception:
+                    pass
                 return
 
             self.add_bubble(int(n), scene_pos.x(), scene_pos.y())
             try:
-                self._set_pending_bubble_number(self._lowest_available_number())
+                self._set_pending_bubble_number(self._next_available_number_at_or_after(int(n) + 1))
             except Exception:
                 pass
             self.add_bubble_btn.setText("Click to place")

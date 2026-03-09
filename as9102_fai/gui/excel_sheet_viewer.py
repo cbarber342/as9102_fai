@@ -9,7 +9,7 @@ import logging
 
 from PySide6.QtCore import Qt, QEvent, QPoint, QTimer, Signal, QSignalBlocker, QItemSelection, QItemSelectionModel, QRect
 from PySide6.QtGui import QColor, QFont, QPen, QGuiApplication, QKeySequence, QShortcut, QPalette, QTextOption, QFontMetrics
-from PySide6.QtWidgets import QAbstractItemView, QAbstractItemDelegate, QStyledItemDelegate, QTableWidget, QTableWidgetItem, QWidget, QVBoxLayout, QMenu, QStyleOptionViewItem, QStyle, QTableWidgetSelectionRange, QTextEdit
+from PySide6.QtWidgets import QAbstractItemView, QAbstractItemDelegate, QStyledItemDelegate, QTableWidget, QTableWidgetItem, QWidget, QVBoxLayout, QHBoxLayout, QMenu, QStyleOptionViewItem, QStyle, QTableWidgetSelectionRange, QTextEdit, QLabel
 
 from openpyxl.styles import PatternFill
 
@@ -259,6 +259,13 @@ class ExcelSheetViewer(QWidget):
         # Persist edits back to the worksheet.
         self.table.itemChanged.connect(self._on_item_changed)
 
+        # Excel-like selection status (bottom-right): Count (includes blanks) + Sum (numeric only).
+        self._selection_summary_label: Optional[QLabel] = None
+        try:
+            self.table.itemSelectionChanged.connect(self._update_selection_summary)
+        except Exception:
+            pass
+
         # Optional click paint behavior (used by Form 3 color selectors).
         self.table.cellClicked.connect(self._on_cell_clicked)
 
@@ -282,6 +289,175 @@ class ExcelSheetViewer(QWidget):
         self.table.verticalHeader().sectionResized.connect(self._on_row_resized)
 
         layout.addWidget(self.table)
+
+        # Bottom-right selection summary row.
+        try:
+            self._selection_summary_label = QLabel(self)
+            self._selection_summary_label.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            self._selection_summary_label.setText("Count: 0    Sum: 0")
+            summary_row = QHBoxLayout()
+            summary_row.setContentsMargins(6, 0, 6, 0)
+            summary_row.addStretch(1)
+            summary_row.addWidget(self._selection_summary_label)
+            layout.addLayout(summary_row)
+        except Exception:
+            self._selection_summary_label = None
+
+        try:
+            self._update_selection_summary()
+        except Exception:
+            pass
+
+    def _format_selection_sum(self, value: float) -> str:
+        try:
+            if value == int(value):
+                return str(int(value))
+        except Exception:
+            pass
+        try:
+            return f"{float(value):.10g}"
+        except Exception:
+            return str(value)
+
+    def _coerce_numeric(self, value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        # Excel ignores booleans for sum in the status bar.
+        try:
+            if isinstance(value, bool):
+                return None
+        except Exception:
+            pass
+
+        try:
+            if isinstance(value, (int, float)):
+                return float(value)
+        except Exception:
+            pass
+
+        try:
+            from decimal import Decimal
+
+            if isinstance(value, Decimal):
+                return float(value)
+        except Exception:
+            pass
+
+        if isinstance(value, str):
+            s = value.strip()
+            if not s:
+                return None
+            # Common human-formatted numbers: commas, parens negatives, currency.
+            try:
+                neg = False
+                if s.startswith("(") and s.endswith(")"):
+                    neg = True
+                    s = s[1:-1].strip()
+                s = s.replace(",", "")
+                s = re.sub(r"^[\$\£\€]", "", s)
+                n = float(s)
+                return -n if neg else n
+            except Exception:
+                return None
+
+        return None
+
+    def _get_ws_value_for_sum(self, row_1based: int, col_1based: int) -> Any:
+        ws = getattr(self, "_ws", None)
+        if ws is None:
+            return None
+        try:
+            cell = ws.cell(row=int(row_1based), column=int(col_1based))
+        except Exception:
+            return None
+
+        # If part of a merged region, prefer the top-left cell's value.
+        try:
+            if cell is not None and getattr(cell, "__class__", None) is not None and cell.__class__.__name__ == "MergedCell":
+                rr = int(row_1based)
+                cc = int(col_1based)
+                try:
+                    for merged in list(getattr(ws.merged_cells, "ranges", []) or []):
+                        if merged.min_row <= rr <= merged.max_row and merged.min_col <= cc <= merged.max_col:
+                            cell = ws.cell(row=int(merged.min_row), column=int(merged.min_col))
+                            break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            return cell.value
+        except Exception:
+            return None
+
+    def _update_selection_summary(self) -> None:
+        lbl = getattr(self, "_selection_summary_label", None)
+        if lbl is None:
+            return
+
+        try:
+            ranges = list(self.table.selectedRanges() or [])
+        except Exception:
+            ranges = []
+
+        if not ranges:
+            try:
+                lbl.setText("Count: 0    Sum: 0")
+            except Exception:
+                pass
+            return
+
+        count = 0
+        total = 0.0
+        saw_numeric = False
+
+        # Compute count (includes blanks) and sum (numeric only).
+        for rng in ranges:
+            try:
+                r0 = int(rng.topRow())
+                r1 = int(rng.bottomRow())
+                c0 = int(rng.leftColumn())
+                c1 = int(rng.rightColumn())
+            except Exception:
+                continue
+
+            try:
+                count += int((r1 - r0 + 1) * (c1 - c0 + 1))
+            except Exception:
+                pass
+
+            for rr0 in range(r0, r1 + 1):
+                for cc0 in range(c0, c1 + 1):
+                    val = None
+                    try:
+                        val = self._get_ws_value_for_sum(rr0 + 1, cc0 + 1)
+                    except Exception:
+                        val = None
+                    if val is None:
+                        try:
+                            it = self.table.item(int(rr0), int(cc0))
+                            if it is not None:
+                                val = it.text()
+                        except Exception:
+                            val = None
+                    num = self._coerce_numeric(val)
+                    if num is None:
+                        continue
+                    total += float(num)
+                    saw_numeric = True
+
+        try:
+            sum_text = self._format_selection_sum(total) if saw_numeric else "0"
+        except Exception:
+            sum_text = "0"
+
+        try:
+            lbl.setText(f"Count: {int(count)}    Sum: {sum_text}")
+        except Exception:
+            pass
 
     def set_border_width_scale(self, scale: float) -> None:
         """Scale border thickness (used to make Form 3 borders thinner)."""
@@ -1461,6 +1637,10 @@ class ExcelSheetViewer(QWidget):
             self.table.setRowCount(0)
             self.table.setColumnCount(0)
             self._rendered = False
+            try:
+                self._update_selection_summary()
+            except Exception:
+                pass
             return
 
         ws = self._ws
@@ -1480,6 +1660,11 @@ class ExcelSheetViewer(QWidget):
         self.table.clear()
         self.table.setRowCount(max_row)
         self.table.setColumnCount(max_col)
+
+        try:
+            self._update_selection_summary()
+        except Exception:
+            pass
 
         # Excel-style header labels
         try:
