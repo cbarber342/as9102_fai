@@ -5248,19 +5248,19 @@ class MainWindow(QMainWindow):
         # the initial bubbles_changed may have fired while Form 3 was not ready.
         self._sync_bubbles_to_form3(set(getattr(self, "_last_bubbled_numbers", set()) or set()))
 
-        def _trim_existing_fai_sheet(self, ws, form_key: str = "") -> None:
-                """Trim a loaded FAI worksheet.
+    def _trim_existing_fai_sheet(self, ws, form_key: str = "") -> None:
+        """Trim a loaded FAI worksheet.
 
-                Per request:
-                - Remove columns AA and larger.
-                - Detect the last row that has data, keep 50 rows beyond it, and delete
-                    everything after.
+        Per request:
+        - Remove columns AA and larger.
+        - Detect the last row that has data, keep 50 rows beyond it, and delete
+            everything after.
 
-                Notes:
-                - For Form 3, we use the detected end of the characteristic table so
-                    template formulas/formatting rows don't block trimming.
-                - For other forms, we scan for non-empty, non-formula values.
-                """
+        Notes:
+        - For Form 3, we use the detected end of the characteristic table so
+            template formulas/formatting rows don't block trimming.
+        - For other forms, we scan for non-empty, non-formula values.
+        """
 
         if ws is None:
             return
@@ -6341,6 +6341,41 @@ class MainWindow(QMainWindow):
 
         end_row = _find_table_end_row()
 
+        # Capture per-column border objects from start_row once so we can replicate them onto
+        # every written characteristic row.  Templates often only pre-format a finite number
+        # of data rows; without this, rows beyond that count have no visible cell borders.
+        _row_border_ref: list[object] = []
+        try:
+            for _cc in range(1, 27):  # columns A-Z
+                bdr = getattr(ws.cell(row=start_row, column=_cc), "border", None)
+                _row_border_ref.append(copy.copy(bdr) if bdr is not None else None)
+        except Exception:
+            _row_border_ref = []
+
+        # Check whether any actual border style was found at start_row.
+        # Some templates store borders via Excel Table styles that openpyxl doesn't
+        # surface as cell-level border attributes (all sides come back None/empty).
+        # In that case fall back to an explicit thin border for every data column.
+        def _has_visible_side(bdr) -> bool:
+            if bdr is None:
+                return False
+            for side_name in ("top", "bottom", "left", "right"):
+                s = getattr(bdr, side_name, None)
+                if s and getattr(s, "style", None) and getattr(s, "style", "") not in (None, "none", ""):
+                    return True
+            return False
+
+        _any_border_found = any(_has_visible_side(b) for b in _row_border_ref)
+        if not _any_border_found:
+            # No cell-level borders detected — apply a default thin border to all data cols.
+            try:
+                from openpyxl.styles import Border, Side
+                _thin = Side(style="thin")
+                _default_border = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
+                _row_border_ref = [copy.copy(_default_border) for _ in range(26)]
+            except Exception:
+                _row_border_ref = []
+
         # Base font for the GDT callout column (used to restore when switching away from font mode).
         base_gdt_font = None
         try:
@@ -6490,6 +6525,16 @@ class MainWindow(QMainWindow):
                     continue
 
             row_num += 1
+
+            # Apply border formatting from start_row to this row so every written row
+            # has borders even if the template only pre-formats a limited number of rows.
+            try:
+                if _row_border_ref:
+                    for _cc, _bdr in enumerate(_row_border_ref, start=1):
+                        if _bdr is not None:
+                            ws.cell(row=current_row, column=_cc).border = copy.copy(_bdr)
+            except Exception:
+                pass
 
             ws.cell(row=current_row, column=2).value = row_num
             # Bubble Number is column E in the template (header row shows
@@ -9690,6 +9735,20 @@ class MainWindow(QMainWindow):
                     pass
                 try:
                     self._settings.setValue("paths/chr", path)
+                except Exception:
+                    pass
+                # Apply column/row trim to the Form 3 sheet of the existing FAI
+                # when a Calypso file is selected, then re-render.
+                try:
+                    if (
+                        self._template_wb is not None
+                        and self._form_sheet_names.get("3")
+                        and self._form_viewers.get("3")
+                    ):
+                        ws = self._template_wb[self._form_sheet_names["3"]]
+                        self._trim_form3_sheet_after_calypso_load(ws, keep_blank_rows=50)
+                        self._form_viewers["3"].set_overrides({})
+                        self._form_viewers["3"].render()
                 except Exception:
                     pass
                 return

@@ -210,6 +210,7 @@ class ExcelSheetViewer(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(self.table.horizontalHeader().ResizeMode.Interactive)
         self.table.verticalHeader().setSectionResizeMode(self.table.verticalHeader().ResizeMode.Interactive)
         self.table.setShowGrid(False)
+        self.table.setStyleSheet("QTableWidget, QTableView { background-color: white; }")
         # Wrap is handled per-cell via delegate using WRAP_ROLE.
         self.table.setWordWrap(False)
         # Context menu for optional row insertion actions.
@@ -1769,6 +1770,64 @@ class ExcelSheetViewer(QWidget):
             color = _qcolor_from_openpyxl(getattr(side, "color", None)) or QColor(0, 0, 0)
             return {"width": width, "color": color}
 
+        def _has_visible_borders(specs: Dict[str, Any]) -> bool:
+            try:
+                return any(int((specs.get(side) or {}).get("width") or 0) > 0 for side in ("top", "bottom", "left", "right"))
+            except Exception:
+                return False
+
+        # Determine the real form area from cells that actually contain content,
+        # plus merged header ranges. This keeps fallback borders limited to the
+        # form/header region instead of outlining the entire rendered sheet.
+        content_min_row = None
+        content_max_row = None
+        content_min_col = None
+        content_max_col = None
+
+        try:
+            for r, c in cell_coords:
+                try:
+                    raw = ws.cell(row=r, column=c).value
+                except Exception:
+                    raw = None
+                if raw is None:
+                    continue
+                if isinstance(raw, str) and raw.strip() == "":
+                    continue
+                content_min_row = r if content_min_row is None else min(content_min_row, r)
+                content_max_row = r if content_max_row is None else max(content_max_row, r)
+                content_min_col = c if content_min_col is None else min(content_min_col, c)
+                content_max_col = c if content_max_col is None else max(content_max_col, c)
+        except Exception:
+            content_min_row = None
+            content_max_row = None
+            content_min_col = None
+            content_max_col = None
+
+        try:
+            for merged in list(getattr(ws.merged_cells, "ranges", [])):
+                try:
+                    raw = ws.cell(row=merged.min_row, column=merged.min_col).value
+                except Exception:
+                    raw = None
+                if raw is None:
+                    continue
+                if isinstance(raw, str) and raw.strip() == "":
+                    continue
+                content_min_row = merged.min_row if content_min_row is None else min(content_min_row, merged.min_row)
+                content_max_row = merged.max_row if content_max_row is None else max(content_max_row, merged.max_row)
+                content_min_col = merged.min_col if content_min_col is None else min(content_min_col, merged.min_col)
+                content_max_col = merged.max_col if content_max_col is None else max(content_max_col, merged.max_col)
+        except Exception:
+            pass
+
+        fallback_border = {
+            "top": {"width": 1, "color": QColor(208, 208, 208)},
+            "bottom": {"width": 1, "color": QColor(208, 208, 208)},
+            "left": {"width": 1, "color": QColor(208, 208, 208)},
+            "right": {"width": 1, "color": QColor(208, 208, 208)},
+        }
+
         _fmt_decimal_re = re.compile(r"^[#0]+\.([0]+)$")
 
         def _format_display_value(raw: Any, number_format: Any) -> str:
@@ -1871,7 +1930,7 @@ class ExcelSheetViewer(QWidget):
                 item.setData(self.BASE_FONT_SIZE_ROLE, base_size)
 
                 # Fill
-                bg = None
+                bg = QColor(255, 255, 255)
                 fill = getattr(cell, "fill", None)
                 if fill and getattr(fill, "patternType", None) == "solid":
                     bg = _qcolor_from_openpyxl(getattr(fill, "fgColor", None))
@@ -1897,6 +1956,7 @@ class ExcelSheetViewer(QWidget):
 
                 # Borders
                 border = getattr(cell, "border", None)
+                borders = None
                 if border:
                     borders = {
                         "top": _border_spec(getattr(border, "top", None)),
@@ -1904,7 +1964,20 @@ class ExcelSheetViewer(QWidget):
                         "left": _border_spec(getattr(border, "left", None)),
                         "right": _border_spec(getattr(border, "right", None)),
                     }
+
+                if borders and _has_visible_borders(borders):
                     item.setData(_ExcelBorderDelegate.BORDER_ROLE, borders)
+                else:
+                    try:
+                        if (
+                            content_min_row is not None
+                            and content_min_col is not None
+                            and int(content_min_row) <= r <= int(content_max_row)
+                            and int(content_min_col) <= c <= int(content_max_col)
+                        ):
+                            item.setData(_ExcelBorderDelegate.BORDER_ROLE, fallback_border)
+                    except Exception:
+                        pass
 
                 self.table.setItem(r - 1, c - 1, item)
 
