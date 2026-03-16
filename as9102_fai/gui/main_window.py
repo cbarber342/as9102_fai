@@ -419,6 +419,7 @@ class MainWindow(QMainWindow):
         
         self.parser = ChrParser()
         self.characteristics = []
+        self._calypso_input_rows = []
         self.template_path = ""
         self.pdf_path = ""
         self.drawing_pdf_path = ""
@@ -1406,7 +1407,7 @@ class MainWindow(QMainWindow):
 
         # Clear all file-path edits and internal paths.
         try:
-            self.chr_path_edit.setText("")
+            self._clear_calypso_inputs(clear_machine_selection=False)
         except Exception:
             pass
         try:
@@ -1446,13 +1447,176 @@ class MainWindow(QMainWindow):
         try:
             print("DEBUG: Refreshing equipment combo")
             self._refresh_calibrated_equipment_combo(preserve_selection=False)
-            if last_machine and hasattr(self, "calibrated_equipment_combo") and self.calibrated_equipment_combo is not None:
-                i = self.calibrated_equipment_combo.findText(last_machine)
-                if i >= 0:
-                    self.calibrated_equipment_combo.setCurrentIndex(i)
+            for slot_index, row in self._iter_calypso_input_rows():
+                combo = row.get("combo")
+                if combo is None:
+                    continue
+                stored_name = str(self._settings.value(f"inputs/calibrated_equipment_machine_{slot_index}", "") or "").strip()
+                if not stored_name and slot_index == 0:
+                    stored_name = last_machine
+                if not stored_name:
+                    continue
+                try:
+                    i = combo.findText(stored_name)
+                    if i >= 0:
+                        combo.setCurrentIndex(i)
+                except Exception:
+                    continue
         except Exception:
             pass
         print("DEBUG: load_defaults finished")
+
+    def _iter_calypso_input_rows(self):
+        for slot_index, row in enumerate(list(getattr(self, "_calypso_input_rows", []) or [])):
+            yield slot_index, row
+
+    def _clear_calypso_inputs(self, *, clear_machine_selection: bool = True) -> None:
+        for _slot_index, row in self._iter_calypso_input_rows():
+            path_edit = row.get("path_edit")
+            combo = row.get("combo")
+            try:
+                if path_edit is not None:
+                    path_edit.setText("")
+            except Exception:
+                pass
+            if not clear_machine_selection:
+                continue
+            try:
+                if combo is not None:
+                    combo.setCurrentIndex(0)
+            except Exception:
+                pass
+
+    def _selected_calibrated_equipment_details_for_combo(self, combo) -> tuple[str, str, str] | None:
+        if combo is None:
+            return None
+        try:
+            data = combo.currentData()
+            if isinstance(data, tuple) and len(data) == 3:
+                mid, mtype, due = data
+                return (str(mid or "").strip(), str(mtype or "").strip(), str(due or "").strip())
+        except Exception:
+            pass
+
+        selected_name = str(combo.currentText() or "").strip()
+        if not selected_name:
+            return None
+
+        for name, mid, mtype, due in self._calibrated_equipment_rows_for_dropdown():
+            if str(name or "").strip().lower() == selected_name.lower():
+                return (str(mid or "").strip(), str(mtype or "").strip(), str(due or "").strip())
+        return None
+
+    def _selected_machine_name_for_combo(self, combo) -> str:
+        try:
+            return str(combo.currentText() or "").strip() if combo is not None else ""
+        except Exception:
+            return ""
+
+    def _first_active_calypso_row(self):
+        for _slot_index, row in self._iter_calypso_input_rows():
+            path_edit = row.get("path_edit")
+            path_text = str(path_edit.text() or "").strip() if path_edit is not None else ""
+            if path_text:
+                return row
+        for _slot_index, row in self._iter_calypso_input_rows():
+            path_edit = row.get("path_edit")
+            combo = row.get("combo")
+            path_text = str(path_edit.text() or "").strip() if path_edit is not None else ""
+            combo_text = self._selected_machine_name_for_combo(combo)
+            if path_text or combo_text:
+                return row
+        return None
+
+    def _reload_calypso_inputs(self) -> None:
+        aggregated: list[FaiCharacteristic] = []
+
+        for slot_index, row in self._iter_calypso_input_rows():
+            path_edit = row.get("path_edit")
+            combo = row.get("combo")
+            path = str(path_edit.text() or "").strip() if path_edit is not None else ""
+            if not path:
+                continue
+            parsed = self.parser.parse_file(path)
+            machine_name = self._selected_machine_name_for_combo(combo)
+            details = self._selected_calibrated_equipment_details_for_combo(combo)
+            machine_id = machine_type = calibration_due = ""
+            if details:
+                machine_id, machine_type, calibration_due = details
+
+            for char in parsed:
+                try:
+                    char.machine_name = machine_name
+                    char.machine_id = machine_id
+                    char.machine_type = machine_type
+                    char.calibration_due = calibration_due
+                except Exception:
+                    pass
+                aggregated.append(char)
+
+            try:
+                self._settings.setValue(f"paths/chr_{slot_index}", path)
+                self._settings.setValue(f"last_dir/chr_{slot_index}", os.path.dirname(path))
+                self._settings.setValue(f"inputs/calibrated_equipment_machine_{slot_index}", machine_name)
+            except Exception:
+                pass
+
+        self.characteristics = aggregated
+
+        if self._template_wb is not None:
+            try:
+                self._apply_selected_calibrated_equipment_to_workbook()
+            except Exception:
+                pass
+
+        if self._template_wb is not None and self._form_sheet_names.get("3") and self._form_viewers.get("3"):
+            ws = self._template_wb[self._form_sheet_names["3"]]
+            self._write_form3_to_worksheet(ws)
+            try:
+                self._trim_form3_sheet_after_calypso_load(ws, keep_blank_rows=50)
+            except Exception:
+                pass
+            self._form_viewers["3"].set_overrides({})
+            self._form_viewers["3"].render()
+            QTimer.singleShot(0, self._sync_bubbles_to_form3)
+
+    def _browse_chr_slot(self, slot_index: int) -> None:
+        row = None
+        for idx, candidate in self._iter_calypso_input_rows():
+            if idx == int(slot_index):
+                row = candidate
+                break
+        if row is None:
+            return
+
+        start_dir = ""
+        try:
+            path_edit = row.get("path_edit")
+            cur = str(path_edit.text() or "").strip() if path_edit is not None else ""
+            if cur:
+                start_dir = os.path.dirname(cur)
+        except Exception:
+            start_dir = ""
+        if not start_dir:
+            try:
+                start_dir = str(self._settings.value(f"last_dir/chr_{slot_index}", "") or "").strip()
+            except Exception:
+                start_dir = ""
+        if not start_dir:
+            try:
+                start_dir = str(self._settings.value("last_dir/chr", "") or "").strip()
+            except Exception:
+                start_dir = ""
+
+        path, _ = QFileDialog.getOpenFileName(self, "Open Calypso File", start_dir, "Text Files (*.txt);;All Files (*)")
+        if path:
+            self.load_chr(path, slot_index=slot_index)
+            combo = row.get("combo")
+            if combo is not None:
+                try:
+                    QTimer.singleShot(0, combo.showPopup)
+                except Exception:
+                    pass
         
     def setup_ui(self):
         central_widget = QWidget()
@@ -1512,23 +1676,10 @@ class MainWindow(QMainWindow):
         file_layout.setContentsMargins(8, 8, 8, 8)
         file_layout.setSpacing(6)
         
-        self.chr_path_edit = QLineEdit()
-        self.chr_path_edit.setPlaceholderText("Drop chr.txt here or click Browse")
-        self.chr_browse_btn = QPushButton("Browse")
-        self.chr_browse_btn.clicked.connect(self.browse_chr)
-
-        # Calibrated equipment selection (machine names) - populated from the Calibrated Equipment tab.
-        self.calibrated_equipment_combo = QComboBox()
-        self.calibrated_equipment_combo.setEditable(False)
-        # Keep it compact (~20 characters wide) per request.
-        try:
-            self.calibrated_equipment_combo.setMinimumContentsLength(20)
-            self.calibrated_equipment_combo.setSizeAdjustPolicy(
-                QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
-            )
-        except Exception:
-            pass
-        self.calibrated_equipment_combo.currentIndexChanged.connect(self._on_calibrated_equipment_combo_changed)
+        self._calypso_input_rows = []
+        self.calibrated_equipment_combo = None
+        self.chr_path_edit = None
+        self.chr_browse_btn = None
         
         self.drawing_pdf_edit = QLineEdit()
         self.drawing_pdf_edit.setPlaceholderText("Drop Drawing PDF here")
@@ -1540,15 +1691,45 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         
-        # Machine dropdown BEFORE the Calypso file path/browse, on the same row.
-        machine_chr_widget = QWidget()
-        machine_chr_layout = QHBoxLayout(machine_chr_widget)
-        machine_chr_layout.setContentsMargins(0, 0, 0, 0)
-        machine_chr_layout.setSpacing(6)
-        machine_chr_layout.addWidget(self.calibrated_equipment_combo)
-        machine_chr_layout.addWidget(self.chr_path_edit)
-        machine_chr_layout.addWidget(self.chr_browse_btn)
-        file_layout.addRow("Machine / Calypso File (*.txt):", machine_chr_widget)
+        for slot_index in range(5):
+            combo = QComboBox()
+            combo.setEditable(False)
+            try:
+                combo.setMinimumContentsLength(20)
+                combo.setSizeAdjustPolicy(
+                    QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+                )
+            except Exception:
+                pass
+            combo.currentIndexChanged.connect(self._on_calibrated_equipment_combo_changed)
+
+            path_edit = QLineEdit()
+            path_edit.setPlaceholderText(f"Drop chr.txt here for Machine {slot_index + 1} or click Browse")
+            browse_btn = QPushButton("Browse")
+            browse_btn.clicked.connect(lambda _checked=False, idx=slot_index: self._browse_chr_slot(idx))
+
+            machine_chr_widget = QWidget()
+            machine_chr_layout = QHBoxLayout(machine_chr_widget)
+            machine_chr_layout.setContentsMargins(0, 0, 0, 0)
+            machine_chr_layout.setSpacing(6)
+            machine_chr_layout.addWidget(combo)
+            machine_chr_layout.addWidget(path_edit)
+            machine_chr_layout.addWidget(browse_btn)
+            file_layout.addRow(f"Machine / Calypso File {slot_index + 1} (*.txt):", machine_chr_widget)
+
+            self._calypso_input_rows.append(
+                {
+                    "combo": combo,
+                    "path_edit": path_edit,
+                    "browse_btn": browse_btn,
+                }
+            )
+
+        if self._calypso_input_rows:
+            first_row = self._calypso_input_rows[0]
+            self.calibrated_equipment_combo = first_row.get("combo")
+            self.chr_path_edit = first_row.get("path_edit")
+            self.chr_browse_btn = first_row.get("browse_btn")
 
         drawing_group = QGroupBox("Drawing")
         drawing_layout = QFormLayout(drawing_group)
@@ -1792,11 +1973,9 @@ class MainWindow(QMainWindow):
             return []
 
     def _refresh_calibrated_equipment_combo(self, preserve_selection: bool = True) -> None:
-        if not hasattr(self, "calibrated_equipment_combo") or self.calibrated_equipment_combo is None:
+        rows_ui = [row for _idx, row in self._iter_calypso_input_rows()]
+        if not rows_ui and (not hasattr(self, "calibrated_equipment_combo") or self.calibrated_equipment_combo is None):
             return
-
-        combo = self.calibrated_equipment_combo
-        prev = str(combo.currentText() or "").strip() if preserve_selection else ""
 
         rows = self._calibrated_equipment_rows_for_dropdown()
         items: list[tuple[str, tuple[str, str, str]]] = []
@@ -1811,61 +1990,70 @@ class MainWindow(QMainWindow):
             seen.add(key)
             items.append((n, (str(mid or "").strip(), str(mtype or "").strip(), str(due or "").strip())))
 
-        try:
-            combo.blockSignals(True)
-            combo.clear()
-            combo.addItem("", None)
-            for name, data in items:
-                combo.addItem(name, data)
-            if prev:
-                i = combo.findText(prev)
-                if i >= 0:
-                    combo.setCurrentIndex(i)
-        finally:
-            combo.blockSignals(False)
+        if not rows_ui and getattr(self, "calibrated_equipment_combo", None) is not None:
+            rows_ui = [{"combo": self.calibrated_equipment_combo}]
+
+        for row in rows_ui:
+            combo = row.get("combo")
+            if combo is None:
+                continue
+            prev = str(combo.currentText() or "").strip() if preserve_selection else ""
+            try:
+                combo.blockSignals(True)
+                combo.clear()
+                combo.addItem("", None)
+                for name, data in items:
+                    combo.addItem(name, data)
+                if prev:
+                    i = combo.findText(prev)
+                    if i >= 0:
+                        combo.setCurrentIndex(i)
+            finally:
+                combo.blockSignals(False)
 
     def _selected_calibrated_equipment_details(self) -> tuple[str, str, str] | None:
         """Return (machine_id, machine_type, calibration_due_date) for current selection."""
 
-        if not hasattr(self, "calibrated_equipment_combo") or self.calibrated_equipment_combo is None:
-            return None
+        active_row = self._first_active_calypso_row()
+        if active_row is not None:
+            details = self._selected_calibrated_equipment_details_for_combo(active_row.get("combo"))
+            if details:
+                return details
 
-        try:
-            data = self.calibrated_equipment_combo.currentData()
-            if isinstance(data, tuple) and len(data) == 3:
-                mid, mtype, due = data
-                return (str(mid or "").strip(), str(mtype or "").strip(), str(due or "").strip())
-        except Exception:
-            pass
-
-        selected_name = str(self.calibrated_equipment_combo.currentText() or "").strip()
-        if not selected_name:
-            return None
-
-        for name, mid, mtype, due in self._calibrated_equipment_rows_for_dropdown():
-            if str(name or "").strip().lower() == selected_name.lower():
-                return (str(mid or "").strip(), str(mtype or "").strip(), str(due or "").strip())
-
-        return None
+        return self._selected_calibrated_equipment_details_for_combo(getattr(self, "calibrated_equipment_combo", None))
 
     def _on_calibrated_equipment_combo_changed(self) -> None:
-        if not hasattr(self, "calibrated_equipment_combo") or self.calibrated_equipment_combo is None:
+        combo = self.sender()
+        if combo is None and hasattr(self, "calibrated_equipment_combo"):
+            combo = self.calibrated_equipment_combo
+        if combo is None:
             return
 
-        name = str(self.calibrated_equipment_combo.currentText() or "").strip()
+        selected_name = str(combo.currentText() or "").strip()
+        slot_index = 0
+        for idx, row in self._iter_calypso_input_rows():
+            if row.get("combo") is combo:
+                slot_index = idx
+                break
         try:
-            self._settings.setValue("inputs/calibrated_equipment_machine", name)
+            self._settings.setValue(f"inputs/calibrated_equipment_machine_{slot_index}", selected_name)
+            if slot_index == 0:
+                self._settings.setValue("inputs/calibrated_equipment_machine", selected_name)
         except Exception:
             pass
 
         # Only apply when a Calypso file is selected (per request).
-        if not str(getattr(self, "chr_path_edit", QLineEdit()).text() or "").strip():
+        has_calypso_input = any(
+            str((row.get("path_edit").text() if row.get("path_edit") is not None else "") or "").strip()
+            for _idx, row in self._iter_calypso_input_rows()
+        )
+        if not has_calypso_input:
             return
         if self._template_wb is None:
             return
 
         try:
-            self._apply_selected_calibrated_equipment_to_workbook()
+            self._reload_calypso_inputs()
         except Exception:
             return
 
@@ -7147,14 +7335,42 @@ class MainWindow(QMainWindow):
             # Fill Form 3 column 10/12 style fields (tooling/comments) for Calypso rows only.
             is_calypso_row = str(getattr(char, "source", "calypso") or "calypso").strip().lower() == "calypso"
             if is_calypso_row:
-                if tooling_col is not None and tooling_value:
+                row_tooling_value = tooling_value
+                row_additional_value = additional_value
+                try:
+                    machine_id = re.sub(
+                        r"^\s*(?:gage\s*id|id)\s*:\s*",
+                        "",
+                        str(getattr(char, "machine_id", "") or ""),
+                        flags=re.IGNORECASE,
+                    ).strip()
+                    due_date = re.sub(
+                        r"^\s*(?:cal\s*due|due)\s*:\s*",
+                        "",
+                        str(getattr(char, "calibration_due", "") or ""),
+                        flags=re.IGNORECASE,
+                    ).strip()
+                    machine_type = str(getattr(char, "machine_type", "") or "").strip()
+                    tooling_parts: list[str] = []
+                    if machine_id:
+                        tooling_parts.append(f"Gage ID: {machine_id}")
+                    if due_date:
+                        tooling_parts.append(f"Cal Due: {due_date}")
+                    if tooling_parts:
+                        row_tooling_value = "  ".join(tooling_parts).strip()
+                    if machine_type:
+                        row_additional_value = machine_type
+                except Exception:
+                    pass
+
+                if tooling_col is not None and row_tooling_value:
                     try:
-                        ws.cell(row=current_row, column=tooling_col).value = tooling_value
+                        ws.cell(row=current_row, column=tooling_col).value = row_tooling_value
                     except Exception:
                         pass
-                if additional_col is not None and additional_value:
+                if additional_col is not None and row_additional_value:
                     try:
-                        ws.cell(row=current_row, column=additional_col).value = additional_value
+                        ws.cell(row=current_row, column=additional_col).value = row_additional_value
                     except Exception:
                         pass
             else:
@@ -9752,40 +9968,7 @@ class MainWindow(QMainWindow):
         return widget
 
     def browse_chr(self):
-        start_dir = ""
-        try:
-            cur = str(self.chr_path_edit.text() or "").strip()
-            if cur:
-                start_dir = os.path.dirname(cur)
-        except Exception:
-            start_dir = ""
-        if not start_dir:
-            try:
-                start_dir = str(self._settings.value("last_dir/chr", "") or "").strip()
-            except Exception:
-                start_dir = ""
-        if not start_dir:
-            try:
-                last_chr = str(self._settings.value("paths/chr", "") or "").strip()
-                if last_chr:
-                    start_dir = os.path.dirname(last_chr)
-            except Exception:
-                start_dir = ""
-
-        path, _ = QFileDialog.getOpenFileName(self, "Open Calypso File", start_dir, "Text Files (*.txt);;All Files (*)")
-        if path:
-            try:
-                self._settings.setValue("last_dir/chr", os.path.dirname(path))
-            except Exception:
-                pass
-            self.load_chr(path)
-
-            # After browsing a Calypso file, prompt for the machine selection.
-            try:
-                self._refresh_calibrated_equipment_combo(preserve_selection=True)
-                QTimer.singleShot(0, self.calibrated_equipment_combo.showPopup)
-            except Exception:
-                pass
+        self._browse_chr_slot(0)
 
     def browse_template(self):
         start_dir = ""
@@ -9956,7 +10139,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             try:
-                self.chr_path_edit.setText("")
+                self._clear_calypso_inputs(clear_machine_selection=False)
             except Exception:
                 pass
             try:
@@ -9996,7 +10179,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             try:
-                self.chr_path_edit.setText("")
+                self._clear_calypso_inputs(clear_machine_selection=False)
             except Exception:
                 pass
             try:
@@ -10118,18 +10301,28 @@ class MainWindow(QMainWindow):
             return
         self._set_drawing_pdf_path(p, load_viewer=True)
 
-    def load_chr(self, path):
+    def load_chr(self, path, slot_index: int = 0):
         # In "Open Existing FAI" mode, do not allow Calypso input to overwrite
         # any forms. (Input Files are disabled, but drag/drop and other paths
         # can still call this.)
+        row = None
+        for idx, candidate in self._iter_calypso_input_rows():
+            if idx == int(slot_index):
+                row = candidate
+                break
+        path_edit = row.get("path_edit") if row is not None else getattr(self, "chr_path_edit", None)
+
         try:
             if self._is_open_existing_fai_mode():
                 try:
-                    self.chr_path_edit.setText(path)
+                    if path_edit is not None:
+                        path_edit.setText(path)
                 except Exception:
                     pass
                 try:
-                    self._settings.setValue("paths/chr", path)
+                    self._settings.setValue(f"paths/chr_{slot_index}", path)
+                    if int(slot_index) == 0:
+                        self._settings.setValue("paths/chr", path)
                 except Exception:
                     pass
                 # Apply column/row trim to the Form 3 sheet of the existing FAI
@@ -10156,29 +10349,20 @@ class MainWindow(QMainWindow):
             self._set_form3_include_thread_extras(False, persist=True, update_ui=True)
         except Exception:
             pass
-        self.chr_path_edit.setText(path)
-        self._settings.setValue("paths/chr", path)
-        self.characteristics = self.parser.parse_file(path)
-
-        # If a machine is already selected and a template is loaded, apply it now.
-        if self._template_wb is not None:
-            try:
-                self._apply_selected_calibrated_equipment_to_workbook()
-            except Exception:
-                pass
-
-        # Re-render Form 3 with new data (if template is loaded)
-        if self._template_wb is not None and self._form_sheet_names.get("3") and self._form_viewers.get("3"):
-            ws = self._template_wb[self._form_sheet_names["3"]]
-            self._write_form3_to_worksheet(ws)
-            try:
-                self._trim_form3_sheet_after_calypso_load(ws, keep_blank_rows=50)
-            except Exception:
-                pass
-            self._form_viewers["3"].set_overrides({})
-            self._form_viewers["3"].render()
-            # The Form 3 table may have just gained bubble numbers; re-sync fills.
-            QTimer.singleShot(0, self._sync_bubbles_to_form3)
+        try:
+            if path_edit is not None:
+                path_edit.setText(path)
+        except Exception:
+            pass
+        try:
+            self._settings.setValue(f"paths/chr_{slot_index}", path)
+            self._settings.setValue(f"last_dir/chr_{slot_index}", os.path.dirname(path))
+            if int(slot_index) == 0:
+                self._settings.setValue("paths/chr", path)
+                self._settings.setValue("last_dir/chr", os.path.dirname(path))
+        except Exception:
+            pass
+        self._reload_calypso_inputs()
 
     def generate_report(self):
         if not self.template_path:
@@ -10274,9 +10458,21 @@ class MainWindow(QMainWindow):
 
     def dropEvent(self, event):
         files = [u.toLocalFile() for u in event.mimeData().urls()]
+        next_calypso_slot = 0
         for f in files:
             if f.lower().endswith('.txt'):
-                self.load_chr(f)
+                assigned = False
+                for idx, row in self._iter_calypso_input_rows():
+                    path_edit = row.get("path_edit")
+                    existing = str(path_edit.text() or "").strip() if path_edit is not None else ""
+                    if not existing:
+                        next_calypso_slot = idx
+                        assigned = True
+                        break
+                if not assigned:
+                    next_calypso_slot = 0
+                self.load_chr(f, slot_index=next_calypso_slot)
+                next_calypso_slot = min(next_calypso_slot + 1, 4)
             elif f.lower().endswith(('.xlsx', '.xlsm')):
                 mode = ""
                 try:

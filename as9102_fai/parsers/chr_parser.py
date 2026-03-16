@@ -32,6 +32,10 @@ class FaiCharacteristic:
     is_attribute: bool = False
     # Original note/comment text from the CHR export (if present).
     comment: str = ""
+    machine_name: str = ""
+    machine_id: str = ""
+    machine_type: str = ""
+    calibration_due: str = ""
     
 class ChrParser:
     def __init__(self):
