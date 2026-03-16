@@ -1823,22 +1823,61 @@ class ExcelSheetViewer(QWidget):
             "right": {"width": 1, "color": QColor(0, 0, 0)},
         }
 
+        form_key = str(getattr(self, "form_key", "") or "").strip()
+        is_form1 = form_key == "1"
+        is_form3 = form_key == "3"
+        form3_border_cols_left = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+        form3_full_border_cols = set()
+
         def _allow_fallback_borders() -> bool:
             try:
-                return str(getattr(self, "form_key", "")) == "3"
+                return is_form3
             except Exception:
                 return False
 
         def _skip_fallback_border_for_cell(r: int, c: int) -> bool:
             """Return True when synthetic fallback borders should not be painted."""
             try:
-                if str(getattr(self, "form_key", "")) == "3" and int(r) <= 3:
+                if is_form3 and int(r) <= 3:
                     return True
-                if str(getattr(self, "form_key", "")) == "3" and int(c) in (21, 22):
+                if is_form3 and int(c) in (21, 22):
                     return True
             except Exception:
                 pass
             return False
+
+        def _form3_border_override(row_1based: int, col_1based: int) -> Optional[Dict[str, Any]]:
+            if not is_form3:
+                return None
+            if row_1based < 4:
+                return {
+                    "top": {"width": 0, "color": None},
+                    "bottom": {"width": 0, "color": None},
+                    "left": {"width": 0, "color": None},
+                    "right": {"width": 0, "color": None},
+                }
+            if not (2 <= col_1based <= 20):
+                return None
+
+            line = {"width": 1, "color": QColor(208, 208, 208)}
+            none = {"width": 0, "color": None}
+            horizontal = dict(none) if col_1based == 16 else dict(line)
+            return {
+                "top": dict(horizontal) if row_1based == 4 else dict(none),
+                "bottom": dict(horizontal),
+                "left": dict(line) if col_1based in form3_border_cols_left else dict(none),
+                "right": dict(line) if col_1based in form3_full_border_cols else dict(none),
+            }
+
+        def _form1_border_override(row_1based: int, col_1based: int) -> Optional[Dict[str, Any]]:
+            if not is_form1 or row_1based >= 4:
+                return None
+            return {
+                "top": {"width": 0, "color": None},
+                "bottom": {"width": 0, "color": None},
+                "left": {"width": 0, "color": None},
+                "right": {"width": 0, "color": None},
+            }
 
         _fmt_decimal_re = re.compile(r"^[#0]+\.([0]+)$")
 
@@ -1977,7 +2016,13 @@ class ExcelSheetViewer(QWidget):
                         "right": _border_spec(getattr(border, "right", None)),
                     }
 
-                if borders and _has_visible_borders(borders):
+                form1_borders = _form1_border_override(r, c)
+                form3_borders = _form3_border_override(r, c)
+                if form1_borders is not None:
+                    item.setData(_ExcelBorderDelegate.BORDER_ROLE, form1_borders)
+                elif form3_borders is not None:
+                    item.setData(_ExcelBorderDelegate.BORDER_ROLE, form3_borders)
+                elif borders and _has_visible_borders(borders):
                     item.setData(_ExcelBorderDelegate.BORDER_ROLE, borders)
                 else:
                     try:

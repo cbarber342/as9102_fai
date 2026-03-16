@@ -1573,11 +1573,11 @@ class MainWindow(QMainWindow):
         existing_layout.setSpacing(6)
 
         self.existing_fai_path_edit = QLineEdit()
-        self.existing_fai_path_edit.setPlaceholderText("Drop Existing FAI XLSX here")
+        self.existing_fai_path_edit.setPlaceholderText("Drop Existing FAI XLSX/XLSM here")
         self.existing_fai_browse_btn = QPushButton("Browse")
         self.existing_fai_browse_btn.clicked.connect(self.browse_existing_fai)
         existing_layout.addRow(
-            "Existing FAI (*.xlsx):",
+            "Existing FAI (*.xlsx, *.xlsm):",
             self.create_file_row(self.existing_fai_path_edit, self.existing_fai_browse_btn),
         )
 
@@ -5099,6 +5099,7 @@ class MainWindow(QMainWindow):
                 pass
 
         self._detect_form_sheets(self._template_wb)
+        self._ensure_form_header_merges(self._template_wb)
 
         # Customer list (Customer -> Supplier Code)
         # This also merges any legacy hidden sheets on first creation.
@@ -5411,6 +5412,47 @@ class MainWindow(QMainWindow):
         # If the drawing bubbles were loaded before (or during) template load,
         # the initial bubbles_changed may have fired while Form 3 was not ready.
         self._sync_bubbles_to_form3(set(getattr(self, "_last_bubbled_numbers", set()) or set()))
+
+    def _ensure_form_header_merges(self, wb) -> None:
+        """Apply requested row-2 header merges for the visible AS9102 forms."""
+        if wb is None:
+            return
+
+        target_ranges = {
+            "1": "B2:F2",
+            "2": "B2:I2",
+            "2c": "B2:D2",
+            "3": "B2:O2",
+        }
+
+        def _ranges_overlap(a, b) -> bool:
+            return not (
+                int(a.max_row) < int(b.min_row)
+                or int(b.max_row) < int(a.min_row)
+                or int(a.max_col) < int(b.min_col)
+                or int(b.max_col) < int(a.min_col)
+            )
+
+        for form_key, merge_ref in target_ranges.items():
+            try:
+                sheet_name = self._form_sheet_names.get(form_key)
+                if not sheet_name or sheet_name not in wb.sheetnames:
+                    continue
+                ws = wb[sheet_name]
+                existing = list(getattr(ws.merged_cells, "ranges", []) or [])
+                if any(str(rng) == merge_ref for rng in existing):
+                    continue
+
+                target_range = openpyxl.worksheet.cell_range.CellRange(merge_ref)
+                for rng in existing:
+                    try:
+                        if _ranges_overlap(rng, target_range):
+                            ws.unmerge_cells(str(rng))
+                    except Exception:
+                        continue
+                ws.merge_cells(merge_ref)
+            except Exception:
+                continue
 
     def _trim_existing_fai_sheet(self, ws, form_key: str = "") -> None:
         """Trim a loaded FAI worksheet.
@@ -9798,7 +9840,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 start_dir = ""
 
-        path, _ = QFileDialog.getOpenFileName(self, "Open Existing FAI", start_dir, "Excel Files (*.xlsx);;All Files (*)")
+        path, _ = QFileDialog.getOpenFileName(self, "Open Existing FAI", start_dir, "Excel Files (*.xlsx *.xlsm);;All Files (*)")
         if path:
             self._set_existing_fai_path(path)
 
@@ -10235,7 +10277,7 @@ class MainWindow(QMainWindow):
         for f in files:
             if f.lower().endswith('.txt'):
                 self.load_chr(f)
-            elif f.lower().endswith('.xlsx'):
+            elif f.lower().endswith(('.xlsx', '.xlsm')):
                 mode = ""
                 try:
                     if hasattr(self, "fai_mode_combo") and self.fai_mode_combo is not None:
