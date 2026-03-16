@@ -1,5 +1,6 @@
 import openpyxl
-from openpyxl.styles import PatternFill, Font, Alignment
+import copy
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.cell.cell import MergedCell
 from typing import List
 import logging
@@ -85,6 +86,140 @@ class FaiGenerator:
             cell = get_unmerged_cell(row, column)
             cell.value = value
 
+        def has_visible_border(row: int, column: int) -> bool:
+            cell = self.sheet.cell(row=row, column=column)
+            border = getattr(cell, "border", None)
+            if border is None:
+                return False
+            for side_name in ("top", "bottom", "left", "right"):
+                side = getattr(border, side_name, None)
+                if side is not None and getattr(side, "style", None) not in (None, "", "none"):
+                    return True
+            return False
+
+        def find_template_table_bottom_row(start_row: int) -> int:
+            sheet_max = int(getattr(self.sheet, "max_row", 0) or 0)
+            max_scan = min(max(sheet_max, start_row + 60), start_row + 250)
+            last_seen = start_row
+            empty_run = 0
+            found_any = False
+            max_col = min(int(getattr(self.sheet, "max_column", 0) or 0), 26)
+            for row in range(start_row, max_scan + 1):
+                row_has_structure = False
+                for col in range(2, max_col + 1):
+                    cell = self.sheet.cell(row=row, column=col)
+                    if cell.value is not None and str(cell.value).strip() != "":
+                        row_has_structure = True
+                        break
+                    if has_visible_border(row, col):
+                        row_has_structure = True
+                        break
+                if row_has_structure:
+                    found_any = True
+                    last_seen = row
+                    empty_run = 0
+                elif found_any:
+                    empty_run += 1
+                    if empty_run >= 15:
+                        break
+            # Use ws.max_row as fallback — Excel Table styles on empty rows
+            # aren't visible to openpyxl as cell-level borders.
+            return max(start_row, last_seen, sheet_max)
+
+        def ensure_form3_title_merge() -> None:
+            try:
+                title_cell = self.sheet.cell(row=2, column=2)
+                title_text = str(title_cell.value or "").strip()
+                if not title_text or "form 3" not in title_text.lower():
+                    return
+
+                desired = (2, 2, 2, 12)  # B2:L2
+                overlapping: list[str] = []
+                already_merged = False
+                for mr in list(self.sheet.merged_cells.ranges):
+                    if mr.max_row < desired[0] or mr.min_row > desired[2] or mr.max_col < desired[1] or mr.min_col > desired[3]:
+                        continue
+                    if (mr.min_row, mr.min_col, mr.max_row, mr.max_col) == desired:
+                        already_merged = True
+                        break
+                    overlapping.append(str(mr))
+
+                if not already_merged:
+                    for rng in overlapping:
+                        self.sheet.unmerge_cells(rng)
+                    self.sheet.merge_cells(start_row=2, start_column=2, end_row=2, end_column=12)
+
+                try:
+                    title_cell.alignment = (title_cell.alignment or Alignment()).copy(horizontal="left", vertical="center")
+                except Exception:
+                    title_cell.alignment = Alignment(horizontal="left", vertical="center")
+            except Exception:
+                pass
+
+        def apply_form3_border_tweaks(last_row: int) -> None:
+            _thin = Side(style="thin")
+            _none = Side()
+            max_col = min(max(int(getattr(self.sheet, "max_column", 0) or 0), 16), 26)
+
+            def visible(side) -> bool:
+                try:
+                    return bool(side and getattr(side, "style", None) not in (None, "", "none"))
+                except Exception:
+                    return False
+
+            def rebuild_border(cell, *, left=None, right=None, top=None, bottom=None):
+                old = getattr(cell, "border", None) or Border()
+                return Border(
+                    left=left if left is not None else old.left,
+                    right=right if right is not None else old.right,
+                    top=top if top is not None else old.top,
+                    bottom=bottom if bottom is not None else old.bottom,
+                    diagonal=old.diagonal,
+                )
+
+            def edge_border(cell, *, force_left=False, force_right=False, top=None, bottom=None):
+                old = getattr(cell, "border", None) or Border()
+                old_left = old.left if visible(getattr(old, "left", None)) else _thin
+                old_right = old.right if visible(getattr(old, "right", None)) else _thin
+                old_top = old.top if visible(getattr(old, "top", None)) else _thin
+                old_bottom = old.bottom if visible(getattr(old, "bottom", None)) else _thin
+                return Border(
+                    left=_thin if force_left else old_left,
+                    right=_thin if force_right else old_right,
+                    top=top if top is not None else old_top,
+                    bottom=bottom if bottom is not None else old_bottom,
+                    diagonal=old.diagonal,
+                )
+
+            # Rows 1-3: truly borderless.
+            for row in range(1, min(int(getattr(self.sheet, "max_row", 0) or 0), 3) + 1):
+                for col in range(1, max_col + 1):
+                    cell = self.sheet.cell(row=row, column=col)
+                    if isinstance(cell, MergedCell):
+                        continue
+                    cell.border = Border()
+
+            # Column M(13)/N(14): add horizontal borders.  Column P(16): hide horizontal borders.
+            for row in range(4, max(4, int(last_row or 4)) + 1):
+                for cc, force_left, force_right in ((2, True, False),):
+                    cell = self.sheet.cell(row=row, column=cc)
+                    if isinstance(cell, MergedCell):
+                        continue
+                    cell.border = edge_border(cell, force_left=force_left, force_right=force_right)
+                for cc in (13, 14):
+                    cell = self.sheet.cell(row=row, column=cc)
+                    if isinstance(cell, MergedCell):
+                        continue
+                    cell.border = rebuild_border(cell, top=_thin, bottom=_thin)
+                cell = self.sheet.cell(row=row, column=16)
+                if not isinstance(cell, MergedCell):
+                    cell.border = edge_border(cell, force_left=False, force_right=False, top=_none, bottom=_none)
+                for cc in (21, 22):
+                    cell = self.sheet.cell(row=row, column=cc)
+                    if isinstance(cell, MergedCell):
+                        continue
+                    cell.border = Border()
+
         # Determine start row (look for header containing "Char No.")
         # The data should start at row 6 based on the template structure
         start_row = 6  # Fixed start row based on template
@@ -97,6 +232,8 @@ class FaiGenerator:
 
         # Data starts immediately after the header row
         current_row = start_row
+        template_table_bottom_row = find_template_table_bottom_row(start_row)
+        ensure_form3_title_merge()
 
         # Styles for result cell
         red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
@@ -213,6 +350,25 @@ class FaiGenerator:
                         result_cell.fill = red_fill
 
             current_row += 1
+
+        thin_border = Border(
+            left=Side(style='thin'), 
+            right=Side(style='thin'), 
+            top=Side(style='thin'), 
+            bottom=Side(style='thin')
+        )
+
+        target_bottom = max(template_table_bottom_row, current_row - 1)
+        for row in range(start_row, target_bottom + 1):
+            for col in range(2, min(int(getattr(self.sheet, 'max_column', 0) or 0), 26) + 1):
+                cell = self.sheet.cell(row=row, column=col)
+                if not isinstance(cell, MergedCell):
+                    if has_visible_border(start_row, col):
+                        cell.border = copy.copy(self.sheet.cell(row=start_row, column=col).border)
+                    else:
+                        cell.border = thin_border
+
+        apply_form3_border_tweaks(target_bottom)
 
         # Append notes (e.g. extracted from PDF)
         if notes:

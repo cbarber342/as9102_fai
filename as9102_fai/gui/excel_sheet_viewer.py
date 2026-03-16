@@ -228,11 +228,6 @@ class ExcelSheetViewer(QWidget):
             pass
 
         self._border_delegate = _ExcelBorderDelegate(self.table)
-        # Default: make form borders a light gray for a cleaner look.
-        try:
-            self._border_delegate.border_color_override = QColor(200, 200, 200)
-        except Exception:
-            pass
         try:
             self._border_delegate.border_width_scale = 1.0
         except Exception:
@@ -1822,11 +1817,28 @@ class ExcelSheetViewer(QWidget):
             pass
 
         fallback_border = {
-            "top": {"width": 1, "color": QColor(208, 208, 208)},
-            "bottom": {"width": 1, "color": QColor(208, 208, 208)},
-            "left": {"width": 1, "color": QColor(208, 208, 208)},
-            "right": {"width": 1, "color": QColor(208, 208, 208)},
+            "top": {"width": 1, "color": QColor(0, 0, 0)},
+            "bottom": {"width": 1, "color": QColor(0, 0, 0)},
+            "left": {"width": 1, "color": QColor(0, 0, 0)},
+            "right": {"width": 1, "color": QColor(0, 0, 0)},
         }
+
+        def _allow_fallback_borders() -> bool:
+            try:
+                return str(getattr(self, "form_key", "")) == "3"
+            except Exception:
+                return False
+
+        def _skip_fallback_border_for_cell(r: int, c: int) -> bool:
+            """Return True when synthetic fallback borders should not be painted."""
+            try:
+                if str(getattr(self, "form_key", "")) == "3" and int(r) <= 3:
+                    return True
+                if str(getattr(self, "form_key", "")) == "3" and int(c) in (21, 22):
+                    return True
+            except Exception:
+                pass
+            return False
 
         _fmt_decimal_re = re.compile(r"^[#0]+\.([0]+)$")
 
@@ -1970,10 +1982,16 @@ class ExcelSheetViewer(QWidget):
                 else:
                     try:
                         if (
+                            _allow_fallback_borders()
+                            and (
+                            not _skip_fallback_border_for_cell(r, c)
+                            and (
                             content_min_row is not None
                             and content_min_col is not None
                             and int(content_min_row) <= r <= int(content_max_row)
                             and int(content_min_col) <= c <= int(content_max_col)
+                            )
+                            )
                         ):
                             item.setData(_ExcelBorderDelegate.BORDER_ROLE, fallback_border)
                     except Exception:
@@ -1982,6 +2000,32 @@ class ExcelSheetViewer(QWidget):
                 self.table.setItem(r - 1, c - 1, item)
 
             self._in_programmatic_change = False
+
+        try:
+            if str(getattr(self, "form_key", "")) == "1":
+                form1_grid_border = {
+                    "top": {"width": 1, "color": QColor(0, 0, 0)},
+                    "bottom": {"width": 1, "color": QColor(0, 0, 0)},
+                    "left": {"width": 1, "color": QColor(0, 0, 0)},
+                    "right": {"width": 0, "color": None},
+                }
+                form1_grid_border_right = {
+                    "top": {"width": 1, "color": QColor(0, 0, 0)},
+                    "bottom": {"width": 1, "color": QColor(0, 0, 0)},
+                    "left": {"width": 1, "color": QColor(0, 0, 0)},
+                    "right": {"width": 1, "color": QColor(0, 0, 0)},
+                }
+                for r in range(14, self.table.rowCount() + 1):
+                    for c in range(2, min(6, self.table.columnCount()) + 1):
+                        item = self.table.item(r - 1, c - 1)
+                        if item is None:
+                            continue
+                        item.setData(
+                            _ExcelBorderDelegate.BORDER_ROLE,
+                            form1_grid_border_right if c == 6 else form1_grid_border,
+                        )
+        except Exception:
+            pass
 
         self._rendered = True
         # Defer fit until after layout/viewport sizing has settled.

@@ -5169,6 +5169,154 @@ class MainWindow(QMainWindow):
                 except Exception:
                     continue
 
+        def _has_visible_border_obj(bdr) -> bool:
+            if bdr is None:
+                return False
+            for side_name in ("top", "bottom", "left", "right"):
+                try:
+                    side = getattr(bdr, side_name, None)
+                    if side is not None and getattr(side, "style", None) not in (None, "", "none"):
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        def _ensure_form1_title_merge(ws) -> None:
+            try:
+                title_cell = ws.cell(row=2, column=2)
+                title_text = str(title_cell.value or "").strip()
+                if not title_text or "form 1" not in title_text.lower():
+                    return
+
+                desired = (2, 2, 2, 6)  # B2:F2
+                overlapping: list[str] = []
+                already_merged = False
+                for mr in list(ws.merged_cells.ranges):
+                    if mr.max_row < desired[0] or mr.min_row > desired[2] or mr.max_col < desired[1] or mr.min_col > desired[3]:
+                        continue
+                    if (mr.min_row, mr.min_col, mr.max_row, mr.max_col) == desired:
+                        already_merged = True
+                        break
+                    overlapping.append(str(mr))
+
+                if not already_merged:
+                    for rng in overlapping:
+                        ws.unmerge_cells(rng)
+                    ws.merge_cells(start_row=2, start_column=2, end_row=2, end_column=6)
+
+                try:
+                    title_cell.alignment = (title_cell.alignment or Alignment()).copy(horizontal="left", vertical="center")
+                except Exception:
+                    title_cell.alignment = Alignment(horizontal="left", vertical="center")
+            except Exception:
+                pass
+
+        def _ensure_form2_title_merge(ws) -> None:
+            try:
+                title_cell = ws.cell(row=2, column=2)
+                title_text = str(title_cell.value or "").strip()
+                if not title_text or "form 2" not in title_text.lower():
+                    return
+
+                desired = (2, 2, 2, 9)  # B2:I2
+                overlapping: list[str] = []
+                already_merged = False
+                for mr in list(ws.merged_cells.ranges):
+                    if mr.max_row < desired[0] or mr.min_row > desired[2] or mr.max_col < desired[1] or mr.min_col > desired[3]:
+                        continue
+                    if (mr.min_row, mr.min_col, mr.max_row, mr.max_col) == desired:
+                        already_merged = True
+                        break
+                    overlapping.append(str(mr))
+
+                if not already_merged:
+                    for rng in overlapping:
+                        ws.unmerge_cells(rng)
+                    ws.merge_cells(start_row=2, start_column=2, end_row=2, end_column=9)
+
+                try:
+                    title_cell.alignment = (title_cell.alignment or Alignment()).copy(horizontal="left", vertical="center")
+                except Exception:
+                    title_cell.alignment = Alignment(horizontal="left", vertical="center")
+            except Exception:
+                pass
+
+            try:
+                index_title_cell = ws.cell(row=13, column=2)
+                index_title_text = str(index_title_cell.value or "").strip()
+                if index_title_text and "index of part numbers" in index_title_text.lower():
+                    desired = (13, 2, 13, 6)  # B13:F13
+                    overlapping: list[str] = []
+                    already_merged = False
+                    for mr in list(ws.merged_cells.ranges):
+                        if mr.max_row < desired[0] or mr.min_row > desired[2] or mr.max_col < desired[1] or mr.min_col > desired[3]:
+                            continue
+                        if (mr.min_row, mr.min_col, mr.max_row, mr.max_col) == desired:
+                            already_merged = True
+                            break
+                        overlapping.append(str(mr))
+
+                    if not already_merged:
+                        for rng in overlapping:
+                            ws.unmerge_cells(rng)
+                        ws.merge_cells(start_row=13, start_column=2, end_row=13, end_column=6)
+
+                    try:
+                        index_title_cell.alignment = (index_title_cell.alignment or Alignment()).copy(horizontal="left", vertical="center")
+                    except Exception:
+                        index_title_cell.alignment = Alignment(horizontal="left", vertical="center")
+            except Exception:
+                pass
+
+        def _extend_form1_index_borders(ws) -> None:
+            try:
+                max_row = int(getattr(ws, "max_row", 0) or 0)
+            except Exception:
+                max_row = 0
+            if max_row <= 0:
+                return
+
+            header_row = None
+            for rr in range(1, min(max_row, 40) + 1):
+                try:
+                    txt = str(ws.cell(row=rr, column=2).value or "").strip().lower()
+                except Exception:
+                    txt = ""
+                if txt and "part number" in txt and txt.startswith("15."):
+                    header_row = rr
+                    break
+            if header_row is None:
+                return
+
+            source_row = None
+            for rr in range(header_row + 1, min(max_row, header_row + 8) + 1):
+                try:
+                    if any(_has_visible_border_obj(getattr(ws.cell(row=rr, column=cc), "border", None)) for cc in range(2, 7)):
+                        source_row = rr
+                        break
+                except Exception:
+                    continue
+            if source_row is None:
+                source_row = min(header_row + 1, max_row)
+            if source_row <= 0 or source_row > max_row:
+                return
+
+            try:
+                _thin = Side(style="thin")
+            except Exception:
+                return
+
+            full_grid_border = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
+            for rr in range(header_row, max_row + 1):
+                for cc in range(2, 7):
+                    try:
+                        cell = ws.cell(row=rr, column=cc)
+                        if cell is not None and cell.__class__.__name__ == "MergedCell":
+                            continue
+                        cell.border = copy.copy(full_grid_border)
+                    except Exception:
+                        continue
+
         for form_key in ("1", "2", "2c", "3"):
             viewer = self._form_viewers.get(form_key)
             sheet_name = self._form_sheet_names.get(form_key)
@@ -5186,6 +5334,8 @@ class MainWindow(QMainWindow):
             if form_key == "1":
                 self._ensure_form1_reason_dropdown(ws)
                 self._ensure_supplier_directory_dropdown(ws, cell_range="E15:E500")
+                _ensure_form1_title_merge(ws)
+                _extend_form1_index_borders(ws)
 
                 def _set_default_if_blank(cell_addr: str, default_value: str) -> None:
                     try:
@@ -5213,6 +5363,7 @@ class MainWindow(QMainWindow):
                     max_r = 0
                 _apply_default_wrap_columns(ws, [3, 4, 5], max_rows=min(max(max_r, 200), 1500))
             elif form_key == "2":
+                _ensure_form2_title_merge(ws)
                 self._ensure_supplier_directory_dropdown(ws, cell_range="F5:F500")
 
                 # Requested default: Wrap Text for Columns C, D, F on Form 2.
@@ -5238,6 +5389,19 @@ class MainWindow(QMainWindow):
                     pass
             viewer.set_overrides({})
             viewer.render()
+
+        try:
+            form1_name = self._form_sheet_names.get("1")
+            viewer1 = self._form_viewers.get("1")
+            if form1_name and viewer1 is not None and form1_name in self._template_wb.sheetnames:
+                ws1 = self._template_wb[form1_name]
+                _ensure_form1_title_merge(ws1)
+                _extend_form1_index_borders(ws1)
+                viewer1.set_worksheet(ws1)
+                viewer1.set_overrides({})
+                viewer1.render()
+        except Exception:
+            pass
 
         try:
             self._refresh_drawing_viewer_default_save_basename()
@@ -6339,7 +6503,183 @@ class MainWindow(QMainWindow):
                             break
             return max(start_row, last_seen)
 
+        def _find_template_table_bottom_row() -> int:
+            """Find the last visible Form 3 grid row already present in the template.
+
+            The in-app sheet viewer does not emulate Excel's overflow text or implicit
+            table styling, so we preserve the template's explicit row borders all the way
+            through the preformatted blank rows at the bottom of Form 3.
+            """
+
+            def _row_has_structure(rr: int) -> bool:
+                try:
+                    for cc in range(2, min(int(getattr(ws, "max_column", 0) or 0), 26) + 1):
+                        cell = ws.cell(row=rr, column=cc)
+                        if cell.value is not None and str(cell.value).strip() != "":
+                            return True
+                        bdr = getattr(cell, "border", None)
+                        for side_name in ("top", "bottom", "left", "right"):
+                            side = getattr(bdr, side_name, None)
+                            if side is not None and getattr(side, "style", None) not in (None, "", "none"):
+                                return True
+                except Exception:
+                    return False
+                return False
+
+            ws_max = int(getattr(ws, "max_row", 0) or 0)
+            max_scan = min(max(ws_max, start_row + 60), start_row + 250)
+            last_seen = start_row
+            empty_run = 0
+            found_any = False
+            for rr in range(start_row, max_scan + 1):
+                if _row_has_structure(rr):
+                    found_any = True
+                    last_seen = rr
+                    empty_run = 0
+                elif found_any:
+                    empty_run += 1
+                    if empty_run >= 15:
+                        break
+            # Excel templates often style empty rows via Table formatting that
+            # openpyxl cannot see as cell-level borders. Use ws.max_row as a
+            # fallback so borders extend to the template's full defined area.
+            return max(start_row, last_seen, ws_max)
+
+        def _ensure_form3_title_merge() -> None:
+            """Merge the title cell the way Excel visually presents it in the template."""
+            try:
+                title_cell = ws.cell(row=2, column=2)
+                title_text = str(title_cell.value or "").strip()
+                if not title_text or "form 3" not in title_text.lower():
+                    return
+
+                desired = (2, 2, 2, 12)  # B2:L2
+                overlapping: list[str] = []
+                already_merged = False
+                for mr in list(getattr(ws, "merged_cells", []).ranges or []):
+                    if mr.max_row < desired[0] or mr.min_row > desired[2] or mr.max_col < desired[1] or mr.min_col > desired[3]:
+                        continue
+                    if (mr.min_row, mr.min_col, mr.max_row, mr.max_col) == desired:
+                        already_merged = True
+                        break
+                    overlapping.append(str(mr))
+
+                if not already_merged:
+                    for rng in overlapping:
+                        ws.unmerge_cells(rng)
+                    ws.merge_cells(start_row=2, start_column=2, end_row=2, end_column=12)
+
+                try:
+                    title_cell.alignment = (title_cell.alignment or Alignment()).copy(horizontal="left", vertical="center")
+                except Exception:
+                    title_cell.alignment = Alignment(horizontal="left", vertical="center")
+            except Exception:
+                pass
+
+        def _apply_form3_border_tweaks(last_row: int) -> None:
+            """Match the requested Form 3 border layout for the viewer/export workbook.
+
+            Rows 1-3 should be truly borderless. Column M/N needs horizontal
+            lines. Column P should keep only its vertical lines.
+            """
+            try:
+                from openpyxl.styles import Border, Side
+            except Exception:
+                return
+
+            _thin = Side(style="thin")
+            _none = Side()
+            max_col = min(max(int(getattr(ws, "max_column", 0) or 0), 16), 26)
+
+            def _visible(side) -> bool:
+                try:
+                    return bool(side and getattr(side, "style", None) not in (None, "", "none"))
+                except Exception:
+                    return False
+
+            def _rebuild_border(cell, *, left=None, right=None, top=None, bottom=None):
+                try:
+                    old = getattr(cell, "border", None) or Border()
+                    return Border(
+                        left=left if left is not None else old.left,
+                        right=right if right is not None else old.right,
+                        top=top if top is not None else old.top,
+                        bottom=bottom if bottom is not None else old.bottom,
+                        diagonal=old.diagonal,
+                    )
+                except Exception:
+                    return Border()
+
+            def _edge_border(cell, *, force_left=False, force_right=False, top=None, bottom=None):
+                try:
+                    old = getattr(cell, "border", None) or Border()
+                    old_left = old.left if _visible(getattr(old, "left", None)) else _thin
+                    old_right = old.right if _visible(getattr(old, "right", None)) else _thin
+                    old_top = old.top if _visible(getattr(old, "top", None)) else _thin
+                    old_bottom = old.bottom if _visible(getattr(old, "bottom", None)) else _thin
+                    return Border(
+                        left=_thin if force_left else old_left,
+                        right=_thin if force_right else old_right,
+                        top=top if top is not None else old_top,
+                        bottom=bottom if bottom is not None else old_bottom,
+                        diagonal=old.diagonal,
+                    )
+                except Exception:
+                    return Border(
+                        left=_thin if force_left else _none,
+                        right=_thin if force_right else _none,
+                        top=top if top is not None else _thin,
+                        bottom=bottom if bottom is not None else _thin,
+                    )
+
+            # Rows 1-3: truly borderless.
+            for rr in range(1, min(int(getattr(ws, "max_row", 0) or 0), 3) + 1):
+                for cc in range(1, max_col + 1):
+                    try:
+                        cell = ws.cell(row=rr, column=cc)
+                        if cell is not None and cell.__class__.__name__ == "MergedCell":
+                            continue
+                        cell.border = Border()
+                    except Exception:
+                        pass
+
+            # Column M(13)/N(14): add horizontal borders.  Column P(16): hide horizontal borders.
+            for rr in range(4, max(4, int(last_row or 4)) + 1):
+                for cc, force_left, force_right in ((2, True, False),):
+                    try:
+                        cell = ws.cell(row=rr, column=cc)
+                        if cell is not None and cell.__class__.__name__ == "MergedCell":
+                            continue
+                        cell.border = _edge_border(cell, force_left=force_left, force_right=force_right)
+                    except Exception:
+                        pass
+                for cc in (13, 14):
+                    try:
+                        cell = ws.cell(row=rr, column=cc)
+                        if cell is not None and cell.__class__.__name__ == "MergedCell":
+                            continue
+                        cell.border = _rebuild_border(cell, top=_thin, bottom=_thin)
+                    except Exception:
+                        pass
+                try:
+                    cell = ws.cell(row=rr, column=16)
+                    if cell is not None and cell.__class__.__name__ == "MergedCell":
+                        continue
+                    cell.border = _edge_border(cell, force_left=False, force_right=False, top=_none, bottom=_none)
+                except Exception:
+                    pass
+                for cc in (21, 22):
+                    try:
+                        cell = ws.cell(row=rr, column=cc)
+                        if cell is not None and cell.__class__.__name__ == "MergedCell":
+                            continue
+                        cell.border = Border()
+                    except Exception:
+                        pass
+
         end_row = _find_table_end_row()
+        template_table_bottom_row = _find_template_table_bottom_row()
+        _ensure_form3_title_merge()
 
         # Capture per-column border objects from start_row once so we can replicate them onto
         # every written characteristic row.  Templates often only pre-format a finite number
@@ -6802,6 +7142,19 @@ class MainWindow(QMainWindow):
 
             current_row += 1
 
+        # Keep the Form 3 grid visible all the way to the bottom of the template,
+        # even when there are fewer written rows than the preformatted blank area.
+        try:
+            visible_table_bottom = max(template_table_bottom_row, current_row - 1)
+            if _row_border_ref:
+                for rr in range(start_row, visible_table_bottom + 1):
+                    for _cc, _bdr in enumerate(_row_border_ref, start=1):
+                        if _bdr is not None:
+                            ws.cell(row=rr, column=_cc).border = copy.copy(_bdr)
+            _apply_form3_border_tweaks(visible_table_bottom)
+        except Exception:
+            pass
+
     def _update_form3_bubble_fills(self, bubbled_numbers: set[int]) -> None:
         """Apply red/green fills to Form 3 Bubble Number cells based on drawing bubbles."""
 
@@ -7001,7 +7354,7 @@ class MainWindow(QMainWindow):
             self._last_bubbled_numbers = set(s)
         except Exception:
             pass
-        self._update_form3_bubble_fills(s)
+        self._sync_bubbles_to_form3(s)
         try:
             v3 = self._form_viewers.get("3")
             if v3 is not None:
